@@ -30,6 +30,16 @@ internal class SensorsReader: Reader<Sensors_List> {
     private var subscription: IOReportSubscriptionRef? = nil
     private var powers: (CPU: Double, GPU: Double, ANE: Double, RAM: Double, PCI: Double) = (0.0, 0.0, 0.0, 0.0, 0.0)
     
+    // precomputed indexes into the sensors list, rebuilt whenever the list structure changes.
+    // they let read() skip the repeated filter/firstIndex scans over the whole list every tick
+    private var cpuAverageIdx: [Int] = []
+    private var gpuAverageIdx: [Int] = []
+    private var fanIdx: [Int] = []
+    private var hidCpuIdx: [Int] = []
+    private var hidGpuIdx: [Int] = []
+    private var hidSocIdx: [Int] = []
+    private var computedIdx: [String: Int] = [:]
+    
     init(callback: @escaping (T?) -> Void = {_ in }) {
         self.unknownSensorsState = Store.shared.bool(key: "Sensors_unknown", defaultValue: false)
         super.init(.sensors, callback: callback)
@@ -40,6 +50,7 @@ internal class SensorsReader: Reader<Sensors_List> {
         dict?.release()
         
         self.list.sensors = self.sensors()
+        self.rebuildIndexes()
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(self.resetHIDSensors), name: NSWorkspace.didWakeNotification, object: nil)
     }
     
@@ -145,6 +156,66 @@ internal class SensorsReader: Reader<Sensors_List> {
         return results
     }
     
+    /// Rebuilds the index caches from the current sensor list. Must be called whenever
+    /// the list structure changes (init, HID sensors toggle).
+    private func rebuildIndexes() {
+        let sensors = self.list.sensors
+        var cpu: [Int] = []
+        var gpu: [Int] = []
+        var fan: [Int] = []
+        var hcpu: [Int] = []
+        var hgpu: [Int] = []
+        var hsoc: [Int] = []
+        
+        for (i, s) in sensors.enumerated() {
+            if s.group == .CPU && s.type == .temperature && s.average {
+                cpu.append(i)
+            }
+            if s.group == .GPU && s.type == .temperature && s.average {
+                gpu.append(i)
+            }
+            if s.type == .fan && !s.isComputed {
+                fan.append(i)
+            }
+            if s.key.hasPrefix("pACC MTR Temp") || s.key.hasPrefix("eACC MTR Temp") {
+                hcpu.append(i)
+            }
+            if s.key.hasPrefix("GPU MTR Temp") {
+                hgpu.append(i)
+            }
+            if s.key.hasPrefix("SOC MTR Temp") {
+                hsoc.append(i)
+            }
+        }
+        
+        self.cpuAverageIdx = cpu
+        self.gpuAverageIdx = gpu
+        self.fanIdx = fan
+        self.hidCpuIdx = hcpu
+        self.hidGpuIdx = hgpu
+        self.hidSocIdx = hsoc
+        self.computedIdx = [:]
+        for key in ["Average CPU", "Hottest CPU", "Average GPU", "Hottest GPU", "Average SOC", "Hottest SOC",
+                    "Fastest fan", "CPU Power", "GPU Power", "ANE Power", "RAM Power", "PCI Power",
+                    "Total System Consumption", "Average System Total", "PSTR", "VD0R", "ID0R"] {
+            self.computedIdx[key] = sensors.firstIndex(where: { $0.key == key })
+        }
+    }
+    
+    private static func average(_ sensors: [Sensor_p], _ indexes: [Int]) -> (avg: Double, max: Double)? {
+        guard !indexes.isEmpty else { return nil }
+        var total: Double = 0
+        var max: Double = -Double.infinity
+        for i in indexes {
+            let value = sensors[i].value
+            total += value
+            if value > max {
+                max = value
+            }
+        }
+        return (total / Double(indexes.count), max)
+    }
+    
     public override func read() {
         var sensors = self.list.sensors
         
@@ -160,9 +231,8 @@ internal class SensorsReader: Reader<Sensors_List> {
             sensors[i].value = newValue
         }
         
-        var cpuSensors = sensors.filter({ $0.group == .CPU && $0.type == .temperature && $0.average }).map{ $0.value }
-        var gpuSensors = sensors.filter({ $0.group == .GPU && $0.type == .temperature && $0.average }).map{ $0.value }
-        let fanSensors = sensors.filter({ $0.type == .fan && !$0.isComputed })
+        var cpuIdx = self.cpuAverageIdx
+        var gpuIdx = self.gpuAverageIdx
         
         #if arch(arm64)
         if self.HIDState {
@@ -179,64 +249,63 @@ internal class SensorsReader: Reader<Sensors_List> {
                 }
             }
             
-            cpuSensors += sensors.filter({ $0.key.hasPrefix("pACC MTR Temp") || $0.key.hasPrefix("eACC MTR Temp") }).map{ $0.value }
-            gpuSensors += sensors.filter({ $0.key.hasPrefix("GPU MTR Temp") }).map{ $0.value }
+            cpuIdx += self.hidCpuIdx
+            gpuIdx += self.hidGpuIdx
             
-            let socSensors = sensors.filter({ $0.key.hasPrefix("SOC MTR Temp") }).map{ $0.value }
-            if !socSensors.isEmpty {
-                if let idx = sensors.firstIndex(where: { $0.key == "Average SOC" }) {
-                    sensors[idx].value = socSensors.reduce(0, +) / Double(socSensors.count)
+            if let value = SensorsReader.average(sensors, self.hidSocIdx) {
+                if let idx = self.computedIdx["Average SOC"] {
+                    sensors[idx].value = value.avg
                 }
-                if let max = socSensors.max() {
-                    if let idx = sensors.firstIndex(where: { $0.key == "Hottest SOC" }) {
-                        sensors[idx].value = max
-                    }
+                if let idx = self.computedIdx["Hottest SOC"] {
+                    sensors[idx].value = value.max
                 }
             }
         }
         
         if let (cpu, gpu, ane, ram, pci) = self.IOSensors() {
-            if let idx = sensors.firstIndex(where: { $0.key == "CPU Power" }) {
+            if let idx = self.computedIdx["CPU Power"] {
                 sensors[idx].value = cpu
             }
-            if let idx = sensors.firstIndex(where: { $0.key == "GPU Power" }) {
+            if let idx = self.computedIdx["GPU Power"] {
                 sensors[idx].value = gpu
             }
-            if let idx = sensors.firstIndex(where: { $0.key == "ANE Power" }) {
+            if let idx = self.computedIdx["ANE Power"] {
                 sensors[idx].value = ane
             }
-            if let idx = sensors.firstIndex(where: { $0.key == "RAM Power" }) {
+            if let idx = self.computedIdx["RAM Power"] {
                 sensors[idx].value = ram
             }
-            if let idx = sensors.firstIndex(where: { $0.key == "PCI Power" }) {
+            if let idx = self.computedIdx["PCI Power"] {
                 sensors[idx].value = pci
             }
         }
         #endif
         
-        if !cpuSensors.isEmpty {
-            if let idx = sensors.firstIndex(where: { $0.key == "Average CPU" }) {
-                sensors[idx].value = cpuSensors.reduce(0, +) / Double(cpuSensors.count)
+        if let (avg, max) = SensorsReader.average(sensors, cpuIdx) {
+            if let idx = self.computedIdx["Average CPU"] {
+                sensors[idx].value = avg
             }
-            if let max = cpuSensors.max() {
-                if let idx = sensors.firstIndex(where: { $0.key == "Hottest CPU" }) {
-                    sensors[idx].value = max
-                }
+            if let idx = self.computedIdx["Hottest CPU"] {
+                sensors[idx].value = max
             }
         }
-        if !gpuSensors.isEmpty {
-            if let idx = sensors.firstIndex(where: { $0.key == "Average GPU" }) {
-                sensors[idx].value = gpuSensors.reduce(0, +) / Double(gpuSensors.count)
+        if let (avg, max) = SensorsReader.average(sensors, gpuIdx) {
+            if let idx = self.computedIdx["Average GPU"] {
+                sensors[idx].value = avg
             }
-            if let max = gpuSensors.max() {
-                if let idx = sensors.firstIndex(where: { $0.key == "Hottest GPU" }) {
-                    sensors[idx].value = max
-                }
+            if let idx = self.computedIdx["Hottest GPU"] {
+                sensors[idx].value = max
             }
         }
-        if !fanSensors.isEmpty && fanSensors.count > 1 {
-            if let f = fanSensors.max(by: { $0.value < $1.value }) as? Fan {
-                if let idx = sensors.firstIndex(where: { $0.key == "Fastest fan" }) {
+        if self.fanIdx.count > 1 {
+            var fastest: Fan? = nil
+            for i in self.fanIdx {
+                guard let fan = sensors[i] as? Fan else { continue }
+                if let current = fastest, fan.value <= current.value { continue }
+                fastest = fan
+            }
+            if let f = fastest {
+                if let idx = self.computedIdx["Fastest fan"] {
                     if var fan = sensors[idx] as? Fan {
                         fan.value = f.value
                         fan.minSpeed = f.minSpeed
@@ -247,14 +316,14 @@ internal class SensorsReader: Reader<Sensors_List> {
             }
         }
         
-        if let PSTRSensor = sensors.first(where: { $0.key == "PSTR"}), PSTRSensor.value > 0 {
+        if let pstrIdx = self.computedIdx["PSTR"], sensors[pstrIdx].value > 0 {
             let now = ProcessInfo.processInfo.systemUptime
             let sinceLastRead = now - self.lastRead
             let sinceFirstRead = now - self.firstRead
             
-            if let totalIdx = sensors.firstIndex(where: {$0.key == "Total System Consumption"}), sinceLastRead > 0 {
-                sensors[totalIdx].value += PSTRSensor.value * sinceLastRead / 3600
-                if let avgIdx = sensors.firstIndex(where: {$0.key == "Average System Total"}), sinceFirstRead > 0 {
+            if let totalIdx = self.computedIdx["Total System Consumption"], sinceLastRead > 0 {
+                sensors[totalIdx].value += sensors[pstrIdx].value * sinceLastRead / 3600
+                if let avgIdx = self.computedIdx["Average System Total"], sinceFirstRead > 0 {
                     sensors[avgIdx].value = sensors[totalIdx].value * 3600 / sinceFirstRead
                 }
             }
@@ -263,20 +332,27 @@ internal class SensorsReader: Reader<Sensors_List> {
         }
         
         // cut off low dc in voltage
-        if let idx = sensors.firstIndex(where: { $0.key == "VD0R" }), sensors[idx].value < 0.4 {
+        if let idx = self.computedIdx["VD0R"], sensors[idx].value < 0.4 {
             sensors[idx].value = 0
         }
         // cut off low dc in current
-        if let idx = sensors.firstIndex(where: { $0.key == "ID0R" }), sensors[idx].value < 0.05 {
+        if let idx = self.computedIdx["ID0R"], sensors[idx].value < 0.05 {
             sensors[idx].value = 0
         }
         
-        let updated = Dictionary(sensors.map{ ($0.key, $0) }, uniquingKeysWith: { (first, _) in first })
         self.list.update { current in
             var list = current
-            for i in list.indices {
-                if let sensor = updated[list[i].key] {
-                    list[i] = sensor
+            if list.count == sensors.count {
+                // the common case: same list structure, update every value in place
+                for i in list.indices {
+                    list[i] = sensors[i]
+                }
+            } else {
+                // the list changed during this read (e.g. HID sensors toggle): merge by key
+                for sensor in sensors {
+                    if let idx = list.firstIndex(where: { $0.key == sensor.key }) {
+                        list[idx] = sensor
+                    }
                 }
             }
             return list
@@ -524,6 +600,7 @@ extension SensorsReader {
                 current.filter({ $0.group != .hid })
             }
         }
+        self.rebuildIndexes()
     }
 }
 

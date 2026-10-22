@@ -116,6 +116,8 @@ public class ProcessReader: Reader<[TopProcess]> {
     
     private typealias dynGetResponsiblePidFuncType = @convention(c) (CInt) -> CInt
     
+    private var nameCache: [Int32: (ts: TimeInterval, command: String)] = [:]
+    
     public override func setup() {
         self.popup = true
         self.preview = true
@@ -127,44 +129,8 @@ public class ProcessReader: Reader<[TopProcess]> {
             return
         }
         
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/top")
-        if self.combinedProcesses {
-            task.arguments = ["-l", "1", "-o", "mem", "-stats", "pid,command,mem"]
-        } else {
-            task.arguments = ["-l", "1", "-o", "mem", "-n", "\(self.numberOfProcesses)", "-stats", "pid,command,mem"]
-        }
-        
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        
-        defer {
-            outputPipe.fileHandleForReading.closeFile()
-            errorPipe.fileHandleForReading.closeFile()
-        }
-        
-        task.standardOutput = outputPipe
-        task.standardError = errorPipe
-        
-        do {
-            try task.run()
-        } catch let err {
-            error("top(): \(err.localizedDescription)", log: self.log)
-            return
-        }
-        
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: outputData, encoding: .utf8)
-        _ = String(data: errorData, encoding: .utf8)
-        guard let output, !output.isEmpty else { return }
-        
-        var processes: [TopProcess] = []
-        output.enumerateLines { (line, _) in
-            if line.matches("^\\d+\\** +.* +\\d+[A-Z]*\\+?\\-? *$") {
-                processes.append(ProcessReader.parseProcess(line))
-            }
-        }
+        // in-process sampling via libproc (no fork/exec of top); falls back to top on failure
+        let processes = self.readLocalProcesses() ?? self.readWithTop()
         
         if !self.combinedProcesses {
             self.callback(processes)
@@ -205,6 +171,102 @@ public class ProcessReader: Reader<[TopProcess]> {
         
         result.sort { $0.usage > $1.usage }
         self.callback(Array(result.prefix(self.numberOfProcesses)))
+    }
+    
+    private func readLocalProcesses() -> [TopProcess]? {
+        guard let pids = listAllPids() else { return nil }
+        
+        var list: [(pid: Int32, usage: Double)] = []
+        list.reserveCapacity(pids.count)
+        for pid in pids {
+            var usage = rusage_info_current()
+            let result = withUnsafeMutablePointer(to: &usage) {
+                $0.withMemoryRebound(to: (rusage_info_t?.self), capacity: 1) {
+                    proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0)
+                }
+            }
+            guard result != -1 else { continue }
+            list.append((pid, Double(usage.ri_resident_size)))
+        }
+        guard !list.isEmpty else { return nil }
+        
+        list.sort { $0.usage > $1.usage }
+        
+        // in combined mode all processes are needed for the grouping by responsible pid
+        let limit = self.combinedProcesses ? list.count : self.numberOfProcesses
+        var processes: [TopProcess] = []
+        processes.reserveCapacity(min(limit, list.count))
+        for item in list.prefix(limit) {
+            processes.append(TopProcess(pid: Int(item.pid), name: self.processName(item.pid), usage: item.usage))
+        }
+        return processes
+    }
+    
+    private func processName(_ pid: Int32) -> String {
+        let now = Date().timeIntervalSince1970
+        var command: String
+        if let cached = self.nameCache[pid], now - cached.ts < 30 {
+            command = cached.command
+        } else {
+            command = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+            self.nameCache[pid] = (now, command)
+            if self.nameCache.count > 2048 {
+                self.nameCache = [:]
+            }
+        }
+        
+        var name: String = command
+        if let app = NSRunningApplication(processIdentifier: pid), let n = app.localizedName {
+            name = n
+        }
+        if command.contains("com.apple.Virtua") && name.contains("Docker") {
+            name = "Docker"
+        }
+        
+        return name
+    }
+    
+    private func readWithTop() -> [TopProcess] {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/top")
+        if self.combinedProcesses {
+            task.arguments = ["-l", "1", "-o", "mem", "-stats", "pid,command,mem"]
+        } else {
+            task.arguments = ["-l", "1", "-o", "mem", "-n", "\(self.numberOfProcesses)", "-stats", "pid,command,mem"]
+        }
+        
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        
+        defer {
+            outputPipe.fileHandleForReading.closeFile()
+            errorPipe.fileHandleForReading.closeFile()
+        }
+        
+        task.standardOutput = outputPipe
+        task.standardError = errorPipe
+        
+        do {
+            try task.run()
+        } catch let err {
+            error("top(): \(err.localizedDescription)", log: self.log)
+            return []
+        }
+        
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: outputData, encoding: .utf8)
+        _ = String(data: errorData, encoding: .utf8)
+        guard let output, !output.isEmpty else { return [] }
+        
+        var processes: [TopProcess] = []
+        output.enumerateLines { (line, _) in
+            if line.matches("^\\d+\\** +.* +\\d+[A-Z]*\\+?\\-? *$") {
+                processes.append(ProcessReader.parseProcess(line))
+            }
+        }
+        
+        return processes
     }
     
     private static let dynGetResponsiblePidFunc: UnsafeMutableRawPointer? = {
@@ -249,9 +311,7 @@ public class ProcessReader: Reader<[TopProcess]> {
             .replacingOccurrences(of: pidString, with: "")
             .trimmingCharacters(in: .whitespaces)
         
-        if let regex = try? NSRegularExpression(pattern: " (\\+|\\-)*$", options: .caseInsensitive) {
-            command = regex.stringByReplacingMatches(in: command, options: [], range: NSRange(location: 0, length: command.count), withTemplate: "")
-        }
+        command = command.removedRegexMatches(pattern: " (\\+|\\-)*$", replaceWith: "")
         
         let pid = Int(pidString.filter("01234567890.".contains)) ?? 0
         var usage = Double(usageString.filter("01234567890.".contains)) ?? 0

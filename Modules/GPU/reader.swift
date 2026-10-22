@@ -99,31 +99,71 @@ internal class InfoReader: Reader<GPUs> {
         }
     }
     
+    private struct acceleratorInfo {
+        let ioClass: String
+        let stats: [String: Any]
+        let pciMatch: String
+        let agcInfo: [String: Int]?
+    }
+    
+    /// Fetches only the registry keys the reader needs from every IOAccelerator, instead of
+    /// copying each accelerator's entire property dictionary on every read.
+    private func fetchAccelerators() -> [acceleratorInfo]? {
+        var iterator = io_iterator_t()
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(kIOAcceleratorClassName), &iterator) == kIOReturnSuccess else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+        
+        var accelerators: [acceleratorInfo] = []
+        var obj = IOIteratorNext(iterator)
+        while obj != 0 {
+            defer {
+                IOObjectRelease(obj)
+                obj = IOIteratorNext(iterator)
+            }
+            
+            guard let ioClass = getIOProperty(obj, "IOClass") as? String else {
+                error("IOClass not found", log: self.log)
+                continue
+            }
+            guard let stats = getIOProperty(obj, "PerformanceStatistics") as? [String: Any] else {
+                error("PerformanceStatistics not found", log: self.log)
+                continue
+            }
+            
+            let pciMatch = ((getIOProperty(obj, "IOPCIMatch") as? String) ?? (getIOProperty(obj, "IOPCIPrimaryMatch") as? String) ?? "").lowercased()
+            accelerators.append(acceleratorInfo(
+                ioClass: ioClass,
+                stats: stats,
+                pciMatch: pciMatch,
+                agcInfo: getIOProperty(obj, "AGCInfo") as? [String: Int]
+            ))
+        }
+        
+        return accelerators.isEmpty ? nil : accelerators
+    }
+    
+    private func getIOProperty(_ entry: io_object_t, _ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    }
+    
     public override func read() {
-        guard let accelerators = fetchIOService(kIOAcceleratorClassName) else {
+        guard let accelerators = self.fetchAccelerators() else {
             return
         }
         var devices = self.devices
         
         for (index, accelerator) in accelerators.enumerated() {
-            guard let IOClass = accelerator.object(forKey: "IOClass") as? String else {
-                error("IOClass not found", log: self.log)
-                continue
-            }
-            
-            guard let stats = accelerator["PerformanceStatistics"] as? [String: Any] else {
-                error("PerformanceStatistics not found", log: self.log)
-                continue
-            }
+            let IOClass = accelerator.ioClass
             
             var id: String = ""
             var vendor: String? = nil
             var model: String = ""
             var cores: Int? = nil
-            let accMatch = (accelerator["IOPCIMatch"] as? String ?? accelerator["IOPCIPrimaryMatch"] as? String ?? "").lowercased()
             
             for (i, device) in devices.enumerated() {
-                if accMatch.range(of: device.pci) != nil && !device.used {
+                if accelerator.pciMatch.range(of: device.pci) != nil && !device.used {
                     model = device.model
                     vendor = device.vendor
                     id = "\(model) #\(index)"
@@ -136,13 +176,13 @@ internal class InfoReader: Reader<GPUs> {
             var predictModel = ""
             var type: GPU_types = .unknown
             
-            let utilization: Int? = stats["Device Utilization %"] as? Int ?? stats["GPU Activity(%)"] as? Int ?? nil
-            let renderUtilization: Int? = stats["Renderer Utilization %"] as? Int ?? nil
-            let tilerUtilization: Int? = stats["Tiler Utilization %"] as? Int ?? nil
-            var temperature: Int? = stats["Temperature(C)"] as? Int ?? nil
-            let fanSpeed: Int? = stats["Fan Speed(%)"] as? Int ?? nil
-            let coreClock: Int? = stats["Core Clock(MHz)"] as? Int ?? nil
-            let memoryClock: Int? = stats["Memory Clock(MHz)"] as? Int ?? nil
+            let utilization: Int? = accelerator.stats["Device Utilization %"] as? Int ?? accelerator.stats["GPU Activity(%)"] as? Int ?? nil
+            let renderUtilization: Int? = accelerator.stats["Renderer Utilization %"] as? Int ?? nil
+            let tilerUtilization: Int? = accelerator.stats["Tiler Utilization %"] as? Int ?? nil
+            var temperature: Int? = accelerator.stats["Temperature(C)"] as? Int ?? nil
+            let fanSpeed: Int? = accelerator.stats["Fan Speed(%)"] as? Int ?? nil
+            let coreClock: Int? = accelerator.stats["Core Clock(MHz)"] as? Int ?? nil
+            let memoryClock: Int? = accelerator.stats["Memory Clock(MHz)"] as? Int ?? nil
             
             if ioClass == "nvaccelerator" || ioClass.contains("nvidia") { // nvidia
                 predictModel = "Nvidia Graphics"
@@ -166,7 +206,7 @@ internal class InfoReader: Reader<GPUs> {
                     }
                 }
             } else if ioClass.contains("agx") { // apple
-                predictModel = stats["model"] as? String ?? "Apple Graphics"
+                predictModel = accelerator.stats["model"] as? String ?? "Apple Graphics"
                 if let display = self.displays.first(where: { $0.vendor == "sppci_vendor_Apple" }) {
                     if let name = display.name {
                         predictModel = name
@@ -202,7 +242,7 @@ internal class InfoReader: Reader<GPUs> {
                 return
             }
             
-            if let agcInfo = accelerator["AGCInfo"] as? [String: Int], let state = agcInfo["poweredOffByAGC"] {
+            if let agcInfo = accelerator.agcInfo, let state = agcInfo["poweredOffByAGC"] {
                 self.gpus.list[idx].state = state == 0
             }
             

@@ -49,6 +49,7 @@ internal class CapacityReader: Reader<Disks> {
     internal var list: Disks = Disks()
     
     private var purgableSpace: [URL: (Date, Int64)] = [:]
+    private let session = DiskArbitrationSession()
     
     public override func read() {
         let keys: [URLResourceKey] = [.volumeNameKey]
@@ -57,7 +58,7 @@ internal class CapacityReader: Reader<Disks> {
             return
         }
         
-        guard let session = DASessionCreate(kCFAllocatorDefault) else {
+        guard let session = self.session.get() else {
             error("cannot create main DASessionCreate()", log: self.log)
             return
         }
@@ -171,6 +172,11 @@ internal class ActivityReader: Reader<Disks> {
     private let readLock = NSLock()
     private var samples: [UInt64: (read: UInt64?, write: UInt64?, time: UInt64)] = [:]
     
+    private let session = DiskArbitrationSession()
+    // retained IORegistry drivers per volume BSD name, to avoid the registry parent walk
+    // on every read; the entries are released when the volume disappears or is re-attached
+    private var drivers: [String: io_registry_entry_t] = [:]
+    
     override func setup() {
         self.setInterval(1)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(self.reset), name: NSWorkspace.didWakeNotification, object: nil)
@@ -178,6 +184,7 @@ internal class ActivityReader: Reader<Disks> {
     
     deinit {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        self.releaseDrivers()
     }
     
     public override func pause() {
@@ -194,6 +201,17 @@ internal class ActivityReader: Reader<Disks> {
         self.readLock.lock()
         defer { self.readLock.unlock() }
         self.samples.removeAll()
+        self.releaseDrivers()
+    }
+    
+    private func releaseDrivers() {
+        self.drivers.values.forEach { IOObjectRelease($0) }
+        self.drivers.removeAll()
+    }
+    
+    private func readStats(_ driver: io_registry_entry_t) -> NSDictionary? {
+        IORegistryEntryCreateCFProperty(driver, kIOBlockStorageDriverStatisticsKey as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? NSDictionary
     }
     
     public override func read() {
@@ -203,8 +221,9 @@ internal class ActivityReader: Reader<Disks> {
         let keys: [URLResourceKey] = [.volumeNameKey]
         let removableState = Store.shared.bool(key: "Disk_removable", defaultValue: false)
         guard let paths = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys),
-              let session = DASessionCreate(kCFAllocatorDefault) else {
+              let session = self.session.get() else {
             self.samples.removeAll()
+            self.releaseDrivers()
             
             let list = Disks()
             
@@ -220,6 +239,7 @@ internal class ActivityReader: Reader<Disks> {
         
         let list = Disks()
         var values: [UInt64: stats] = [:]
+        var active: Set<String> = []
         for url in paths {
             if url.pathComponents.count == 1 || (url.pathComponents.count > 1 && url.pathComponents[1] == "Volumes") {
                 guard let disk = DADiskCreateFromVolumePath(kCFAllocatorDefault, session, url as CFURL) else {
@@ -229,14 +249,44 @@ internal class ActivityReader: Reader<Disks> {
                     }
                     continue
                 }
-                guard var d = driveDetails(disk, removableState: removableState) else { continue }
+                guard let bsdNameRaw = DADiskGetBSDName(disk) else { continue }
+                let BSDName = String(cString: bsdNameRaw)
+                active.insert(BSDName)
+                
+                // reuse the drive identity from the previous read when the volume did not change,
+                // otherwise the DiskArbitration description would be re-created every second
+                var cachedDrive: drive? = nil
+                if let cached = self.list.first(where: { $0.BSDName == BSDName && $0.path == url }) {
+                    if cached.removable && !removableState {
+                        continue
+                    }
+                    cachedDrive = cached
+                } else {
+                    cachedDrive = driveDetails(disk, removableState: removableState)
+                }
+                guard var d = cachedDrive else { continue }
                 defer { list.append(d) }
                 
-                let media = DADiskCopyIOMedia(disk)
-                guard media != 0 else { continue }
-                defer { IOObjectRelease(media) }
-                guard let driver = getDeviceIOParent(media) else { continue }
-                defer { IOObjectRelease(driver) }
+                var driver = self.drivers[BSDName]
+                var counters = driver.flatMap { self.readStats($0) }
+                if counters == nil, let cached = driver {
+                    // the cached entry stopped serving stats (e.g. disk re-attached): drop it and re-resolve
+                    IOObjectRelease(cached)
+                    self.drivers.removeValue(forKey: BSDName)
+                    driver = nil
+                }
+                if counters == nil, driver == nil {
+                    let media = DADiskCopyIOMedia(disk)
+                    guard media != 0 else { continue }
+                    defer { IOObjectRelease(media) }
+                    guard let resolved = getDeviceIOParent(media) else { continue }
+                    // ownership of the retained driver moves into the cache
+                    self.drivers[BSDName] = resolved
+                    driver = resolved
+                    counters = self.readStats(resolved)
+                }
+                guard let driver else { continue }
+                
                 var id: UInt64 = 0
                 guard IORegistryEntryGetRegistryEntryID(driver, &id) == KERN_SUCCESS else { continue }
                 
@@ -245,8 +295,6 @@ internal class ActivityReader: Reader<Disks> {
                     continue
                 }
                 
-                let property = IORegistryEntryCreateCFProperty(driver, kIOBlockStorageDriverStatisticsKey as CFString, kCFAllocatorDefault, 0)
-                let counters = property?.takeRetainedValue() as? NSDictionary
                 let time = DispatchTime.now().uptimeNanoseconds
                 let previous = self.samples[id]
                 let elapsed = previous.map { time > $0.time ? Double(time - $0.time) / 1_000_000_000 : 0 } ?? 0
@@ -257,6 +305,11 @@ internal class ActivityReader: Reader<Disks> {
                 self.samples[id] = (read.bytes, write.bytes, time)
                 values[id] = d.activity
             }
+        }
+        
+        for BSDName in self.drivers.keys where !active.contains(BSDName) {
+            IOObjectRelease(self.drivers[BSDName]!)
+            self.drivers.removeValue(forKey: BSDName)
         }
         
         list.sort()
@@ -277,6 +330,21 @@ internal class ActivityReader: Reader<Disks> {
         
         let rate = Double(bytes - previous) / elapsed
         return (bytes, rate >= Double(Int64.max) ? Int64.max : Int64(rate))
+    }
+}
+
+/// Keeps a long-lived DiskArbitration session. Creating a DASession on every read sets up
+/// a new XPC session each time; a session only used for synchronous calls can be reused.
+internal class DiskArbitrationSession {
+    private var session: DASession? = nil
+    
+    func get() -> DASession? {
+        if let session = self.session {
+            return session
+        }
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return nil }
+        self.session = session
+        return session
     }
 }
 
@@ -424,6 +492,8 @@ public class ProcessReader: Reader<[Disk_process]> {
         set { self.queue.sync { self._list = newValue } }
     }
     
+    private var nameCache: [Int32: (ts: TimeInterval, name: String)] = [:]
+    
     private var numberOfProcesses: Int {
         Store.shared.int(key: "\(ModuleType.disk.stringValue)_processes", defaultValue: 5)
     }
@@ -435,7 +505,74 @@ public class ProcessReader: Reader<[Disk_process]> {
     }
     
     public override func read() {
-        guard self.numberOfProcesses != 0, let output = runProcess(path: "/bin/ps", args: ["-Aceo pid,args", "-r"]) else { return }
+        guard self.numberOfProcesses != 0 else { return }
+        
+        // in-process sampling via libproc (no fork/exec of ps); falls back to ps on failure
+        guard var processes = self.readLocalProcesses() ?? self.readWithPs() else { return }
+        
+        processes.sort {
+            let firstMax = max($0.read, $0.write)
+            let secondMax = max($1.read, $1.write)
+            let firstMin = min($0.read, $0.write)
+            let secondMin = min($1.read, $1.write)
+            
+            if firstMax == secondMax && firstMin != secondMin { // max values are the same, min not. Sort by min values
+                return firstMin < secondMin
+            }
+            return firstMax < secondMax // max values are not the same, sort by max value
+        }
+        
+        self.callback(processes.suffix(self.numberOfProcesses).reversed())
+    }
+    
+    private func readLocalProcesses() -> [Disk_process]? {
+        guard let pids = listAllPids() else { return nil }
+        
+        var snapshot = self.list
+        var processes: [Disk_process] = []
+        
+        for pid in pids {
+            var usage = rusage_info_current()
+            let result = withUnsafeMutablePointer(to: &usage) {
+                $0.withMemoryRebound(to: (rusage_info_t?.self), capacity: 1) {
+                    proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0)
+                }
+            }
+            guard result != -1 else { continue }
+            
+            let bytesRead = Int(clamping: usage.ri_diskio_bytesread)
+            let bytesWritten = Int(clamping: usage.ri_diskio_byteswritten)
+            
+            if let v = snapshot[pid] {
+                let read = bytesRead - v.read
+                let write = bytesWritten - v.write
+                if read != 0 || write != 0 {
+                    processes.append(Disk_process(pid: Int(pid), name: self.processName(pid), read: read, write: write))
+                }
+            }
+            
+            snapshot[pid] = io(read: bytesRead, write: bytesWritten)
+        }
+        self.list = snapshot
+        
+        return processes
+    }
+    
+    private func processName(_ pid: Int32) -> String {
+        let now = Date().timeIntervalSince1970
+        if let cached = self.nameCache[pid], now - cached.ts < 30 {
+            return cached.name
+        }
+        let name = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+        self.nameCache[pid] = (now, name)
+        if self.nameCache.count > 2048 {
+            self.nameCache = [:]
+        }
+        return name
+    }
+    
+    private func readWithPs() -> [Disk_process]? {
+        guard let output = runProcess(path: "/bin/ps", args: ["-Aceo", "pid,args", "-r"]) else { return nil }
         
         var snapshot = self.list
         var processes: [Disk_process] = []
@@ -473,19 +610,7 @@ public class ProcessReader: Reader<[Disk_process]> {
         }
         self.list = snapshot
         
-        processes.sort {
-            let firstMax = max($0.read, $0.write)
-            let secondMax = max($1.read, $1.write)
-            let firstMin = min($0.read, $0.write)
-            let secondMin = min($1.read, $1.write)
-            
-            if firstMax == secondMax && firstMin != secondMin { // max values are the same, min not. Sort by min values
-                return firstMin < secondMin
-            }
-            return firstMax < secondMax // max values are not the same, sort by max value
-        }
-        
-        self.callback(processes.suffix(self.numberOfProcesses).reversed())
+        return processes
     }
 }
 
@@ -522,6 +647,7 @@ internal class SMARTReader: Reader<Disks> {
     
     private var smartTotals: [String: (read: Int64, written: Int64)] = [:]
     private var smartEnableAttempted: Set<String> = []
+    private let session = DiskArbitrationSession()
     
     override func setup() {
         self.setInterval(Store.shared.int(key: "\(ModuleType.disk.stringValue)_updateSMARTInterval", defaultValue: 30))
@@ -536,7 +662,7 @@ internal class SMARTReader: Reader<Disks> {
             return
         }
         
-        guard let session = DASessionCreate(kCFAllocatorDefault) else {
+        guard let session = self.session.get() else {
             error("cannot create a DASessionCreate()", log: self.log)
             return
         }

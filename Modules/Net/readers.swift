@@ -99,6 +99,38 @@ extension CWChannel {
     }
 }
 
+/// Shared nettop sampler. The usage reader (in "process" reader mode) and the process reader
+/// both need nettop output every tick; this cache makes them share a single invocation.
+internal class NetTopCache {
+    static let shared = NetTopCache()
+    
+    private let queue = DispatchQueue(label: "eu.exelban.Stats.Net.nettop")
+    private var cached: (ts: DispatchTime, output: String?)? = nil
+    
+    private init() {}
+    
+    func output() -> String? {
+        self.queue.sync {
+            if let cached = self.cached,
+               Double(DispatchTime.now().uptimeNanoseconds - cached.ts.uptimeNanoseconds) / 1_000_000_000 < 1 {
+                return cached.output
+            }
+            
+            let output = process(
+                path: "/usr/bin/nettop",
+                arguments: ["-P", "-L", "1", "-n", "-k", "time,interface,state,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx_win,tc_class,tc_mgt,cc_algo,P,C,R,W,arch"],
+                environment: [
+                    "NSUnbufferedIO": "YES",
+                    "LC_ALL": "en_US.UTF-8"
+                ],
+                timeout: 5
+            )
+            self.cached = (DispatchTime.now(), output)
+            return output
+        }
+    }
+}
+
 internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationManagerDelegate {
     private var reachability: Reachability = Reachability(start: true)
     private let variablesQueue = DispatchQueue(label: "eu.exelban.NetworkUsageReader")
@@ -169,10 +201,16 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
     }
     
     private var vpnConnection: Bool {
-        if let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any], let scopes = settings["__SCOPED__"] as? [String: Any] {
-            return !scopes.filter({ $0.key.contains("tap") || $0.key.contains("tun") || $0.key.contains("ppp") || $0.key.contains("ipsec") || $0.key.contains("ipsec0")}).isEmpty
+        if let cached = self.vpnCache, Date().timeIntervalSince(cached.ts) < 10 {
+            return cached.value
         }
-        return false
+        
+        var value = false
+        if let settings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any], let scopes = settings["__SCOPED__"] as? [String: Any] {
+            value = !scopes.filter({ $0.key.contains("tap") || $0.key.contains("tun") || $0.key.contains("ppp") || $0.key.contains("ipsec") || $0.key.contains("ipsec0")}).isEmpty
+        }
+        self.vpnCache = (Date(), value)
+        return value
     }
     
     private var VPNMode: Bool {
@@ -205,6 +243,11 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
     private var locationManager: CLLocationManager?
     
     private var lastDetailsReadTS: Date = .distantPast
+    
+    // caches to avoid repeating expensive framework calls on every read
+    private var vpnCache: (ts: Date, value: Bool)? = nil
+    private var wifiInterfaceCache: [String: CWInterface?] = [:]
+    private var ethernetRateCache: [String: (ts: Date, rate: Double?)] = [:]
     
     private let detailsQueue = DispatchQueue(label: "eu.exelban.NetworkDetailsReader")
     private var _detailsInProgress: Bool = false
@@ -277,6 +320,9 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         self.resetWiFiDetails()
         self.stopListeningForWifiEvents()
         self.wifiClient.delegate = nil
+        self.wifiInterfaceCache = [:]
+        self.ethernetRateCache = [:]
+        self.vpnCache = nil
     }
     
     public override func read() {
@@ -288,15 +334,17 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
             self.resetWiFiDetails()
             self.usage.bandwidth = Bandwidth()
             self.lastDetailsReadTS = .distantPast
+            self.wifiInterfaceCache = [:]
+            self.ethernetRateCache = [:]
         }
         
-        self.requestDetails()
+        self.requestDetails(interfaceID)
         
         let current: Bandwidth
         if self.reader == "interface" {
-            current = self.readInterfaceBandwidth()
+            current = self.readInterfaceBandwidth(interfaceID)
         } else {
-            self.readInterfaceStatus()
+            self.readInterfaceStatus(interfaceID)
             current = self.readProcessBandwidth()
         }
         
@@ -338,51 +386,64 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         self.usage.bandwidth.download = current.download
     }
     
-    private func readInterfaceBandwidth() -> Bandwidth {
+    private func readInterfaceBandwidth(_ interfaceID: String) -> Bandwidth {
         var interfaceAddresses: UnsafeMutablePointer<ifaddrs>? = nil
         guard getifaddrs(&interfaceAddresses) == 0 else {
             return Bandwidth()
         }
         
-        var pointer = interfaceAddresses
-        while pointer != nil {
-            defer { pointer = pointer?.pointee.ifa_next }
-            guard let pointer = pointer else { break }
-
-            if String(cString: pointer.pointee.ifa_name) != self.interfaceID {
-                continue
+        interfaceID.withCString { target in
+            var pointer = interfaceAddresses
+            var interfaceInfoUpdated = false
+            while let current = pointer {
+                defer { pointer = current.pointee.ifa_next }
+                guard strcmp(current.pointee.ifa_name, target) == 0 else { continue }
+                
+                // an interface appears once per address family; the info only needs to be
+                // refreshed once per read, while the local IPs need every entry
+                if !interfaceInfoUpdated {
+                    self.updateInterfaceInfo(current, interfaceID: interfaceID)
+                    interfaceInfoUpdated = true
+                }
+                self.getLocalIP(current)
             }
-            self.updateInterfaceInfo(pointer)
         }
         freeifaddrs(interfaceAddresses)
         
-        return self.getBytesInfo() ?? Bandwidth()
+        return self.getBytesInfo(interfaceID) ?? Bandwidth()
     }
     
-    private func readInterfaceStatus() {
+    private func readInterfaceStatus(_ interfaceID: String) {
         var interfaceAddresses: UnsafeMutablePointer<ifaddrs>? = nil
         guard getifaddrs(&interfaceAddresses) == 0 else { return }
         
-        var pointer = interfaceAddresses
-        while pointer != nil {
-            defer { pointer = pointer?.pointee.ifa_next }
-            guard let pointer = pointer else { break }
-            
-            if String(cString: pointer.pointee.ifa_name) != self.interfaceID {
-                continue
+        interfaceID.withCString { target in
+            var pointer = interfaceAddresses
+            while let current = pointer {
+                defer { pointer = current.pointee.ifa_next }
+                guard strcmp(current.pointee.ifa_name, target) == 0 else { continue }
+                
+                self.updateInterfaceInfo(current, interfaceID: interfaceID)
+                break
             }
-            self.updateInterfaceInfo(pointer)
         }
         freeifaddrs(interfaceAddresses)
     }
     
-    private func updateInterfaceInfo(_ pointer: UnsafeMutablePointer<ifaddrs>) {
-        let interfaceID = String(cString: pointer.pointee.ifa_name)
+    private func updateInterfaceInfo(_ pointer: UnsafeMutablePointer<ifaddrs>, interfaceID: String) {
         let status = (pointer.pointee.ifa_flags & UInt32(IFF_UP)) != 0
         var transmitRate: Double? = nil
         
-        if let wifiInterface = CWWiFiClient.shared().interface(withName: interfaceID) {
-            transmitRate = wifiInterface.transmitRate()
+        var wifiInterface: CWInterface? = nil
+        if let cached = self.wifiInterfaceCache[interfaceID] {
+            wifiInterface = cached
+        } else {
+            wifiInterface = CWWiFiClient.shared().interface(withName: interfaceID)
+            self.wifiInterfaceCache[interfaceID] = wifiInterface
+        }
+        
+        if let interface = wifiInterface {
+            transmitRate = interface.transmitRate()
         } else if let address = pointer.pointee.ifa_addr, address.pointee.sa_family == UInt8(AF_LINK) {
             transmitRate = 0
             if let raw = pointer.pointee.ifa_data {
@@ -394,7 +455,7 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
                 }
             }
             if transmitRate == 0 {
-                transmitRate = self.readEthernetTransmitRate(interfaceID) ?? 0
+                transmitRate = self.cachedEthernetTransmitRate(interfaceID) ?? 0
             }
         }
         
@@ -407,6 +468,15 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         }
         
         self.getLocalIP(pointer)
+    }
+    
+    private func cachedEthernetTransmitRate(_ interfaceID: String) -> Double? {
+        if let cached = self.ethernetRateCache[interfaceID], Date().timeIntervalSince(cached.ts) < 30 {
+            return cached.rate
+        }
+        let rate = self.readEthernetTransmitRate(interfaceID)
+        self.ethernetRateCache[interfaceID] = (Date(), rate)
+        return rate
     }
     
     private func readEthernetTransmitRate(_ interfaceID: String) -> Double? {
@@ -431,15 +501,7 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
     }
     
     private func readProcessBandwidth() -> Bandwidth {
-        guard let output = process(
-            path: "/usr/bin/nettop",
-            arguments: ["-P", "-L", "1", "-n", "-k", "time,interface,state,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx_win,tc_class,tc_mgt,cc_algo,P,C,R,W,arch"],
-            environment: [
-                "NSUnbufferedIO": "YES",
-                "LC_ALL": "en_US.UTF-8"
-            ],
-            timeout: 5
-        ) else { return Bandwidth() }
+        guard let output = NetTopCache.shared.output() else { return Bandwidth() }
         
         var totalUpload: Int64 = 0
         var totalDownload: Int64 = 0
@@ -466,8 +528,8 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         return Bandwidth(upload: totalUpload, download: totalDownload)
     }
     
-    private func requestDetails() {
-        guard self.interfaceID != "", !self.detailsInProgress else { return }
+    private func requestDetails(_ interfaceID: String) {
+        guard interfaceID != "", !self.detailsInProgress else { return }
         if Date().timeIntervalSince(self.lastDetailsReadTS) < 15 { return }
         
         self.detailsInProgress = true
@@ -701,8 +763,8 @@ internal class UsageReader: Reader<Network_Usage>, CWEventDelegate, CLLocationMa
         }
     }
     
-    private func getBytesInfo() -> Bandwidth? {
-        let index = if_nametoindex(self.interfaceID)
+    private func getBytesInfo(_ interfaceID: String) -> Bandwidth? {
+        let index = if_nametoindex(interfaceID)
         guard index != 0 else { return nil }
         
         var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, Int32(index)]
@@ -853,15 +915,7 @@ public class ProcessReader: Reader<[Network_Process]> {
             return
         }
         
-        guard let output = process(
-            path: "/usr/bin/nettop",
-            arguments: ["-P", "-L", "1", "-n", "-k", "time,interface,state,rx_dupe,rx_ooo,re-tx,rtt_avg,rcvsize,tx_win,tc_class,tc_mgt,cc_algo,P,C,R,W,arch"],
-            environment: [
-                "NSUnbufferedIO": "YES",
-                "LC_ALL": "en_US.UTF-8"
-            ],
-            timeout: 5
-        ) else { return }
+        guard let output = NetTopCache.shared.output() else { return }
         
         var list: [Network_Process] = []
         var firstLine = false

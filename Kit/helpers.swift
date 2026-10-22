@@ -1005,6 +1005,31 @@ internal class WidgetLabelView: NSView {
     }
 }
 
+/// List all pids on the system without spawning an external tool (e.g. ps).
+/// Returns nil when the process list cannot be read.
+public func listAllPids() -> [pid_t]? {
+    let count = proc_listallpids(nil, 0)
+    guard count > 0 else { return nil }
+    var pids = [pid_t](repeating: 0, count: Int(count))
+    let result = proc_listallpids(&pids, count)
+    guard result > 0 else { return nil }
+    return Array(pids[0..<Int(result)])
+}
+
+/// Full executable path of a process, nil when it cannot be read.
+public func processPath(_ pid: pid_t) -> String? {
+    var buffer = [CChar](repeating: 0, count: 1024)
+    guard proc_pidpath(pid, &buffer, 1024) > 0 else { return nil }
+    return String(cString: buffer)
+}
+
+/// Short process name, nil when it cannot be read.
+public func processShortName(_ pid: pid_t) -> String? {
+    var buffer = [CChar](repeating: 0, count: 1024)
+    guard proc_name(pid, &buffer, 1024) > 0 else { return nil }
+    return String(cString: buffer)
+}
+
 public func process(path: String, arguments: [String]) -> String? {
     let task = Process()
     task.executableURL = URL(fileURLWithPath: path)

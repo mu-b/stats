@@ -26,6 +26,8 @@ internal class LoadReader: Reader<CPU_Load> {
     private var numCPUsU: natural_t = 0
     private var usagePerCore: [Double] = []
     private var cores: [core_s]? = nil
+    private var clusterIndexes: (e: [(id: Int, position: Int)], p: [(id: Int, position: Int)], s: [(id: Int, position: Int)]) = ([], [], [])
+    private var prevTotalTicks = (user: Double(0), system: Double(0), idle: Double(0), nice: Double(0))
     
     public override func setup() {
         self.hasHyperthreadingCores = sysctlByName("hw.physicalcpu") != sysctlByName("hw.logicalcpu")
@@ -37,6 +39,21 @@ internal class LoadReader: Reader<CPU_Load> {
             }
         }
         self.cores = SystemKit.shared.device.info.cpu?.cores
+        if let cores = self.cores {
+            self.clusterIndexes = (
+                self.loadClusterIndexes(cores, type: .efficiency),
+                self.loadClusterIndexes(cores, type: .performance),
+                self.loadClusterIndexes(cores, type: .super)
+            )
+        }
+    }
+    
+    private func loadClusterIndexes(_ cores: [core_s], type: coreType) -> [(id: Int, position: Int)] {
+        var indexes: [(id: Int, position: Int)] = []
+        for (i, c) in cores.filter({ $0.type == type }).enumerated() {
+            indexes.append((Int(c.id), i))
+        }
+        return indexes
     }
     
     public override func read() {
@@ -45,20 +62,33 @@ internal class LoadReader: Reader<CPU_Load> {
         let result: kern_return_t = host_processor_info(machHostPort, PROCESSOR_CPU_LOAD_INFO, &self.numCPUsU, &self.cpuInfo, &self.numCpuInfo)
         if result == KERN_SUCCESS {
             self.usagePerCore = []
+            self.usagePerCore.reserveCapacity(Int(self.numCPUs))
             
-            if let prevCpuInfo = self.prevCpuInfo {
-                for i in 0 ..< Int32(self.numCPUs) {
-                    let user = UInt32(bitPattern: self.cpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_USER)])
-                        &- UInt32(bitPattern: prevCpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_USER)])
-                    let system = UInt32(bitPattern: self.cpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_SYSTEM)])
-                        &- UInt32(bitPattern: prevCpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_SYSTEM)])
-                    let nice = UInt32(bitPattern: self.cpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_NICE)])
-                        &- UInt32(bitPattern: prevCpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_NICE)])
-                    let idle = UInt32(bitPattern: self.cpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_IDLE)])
-                        &- UInt32(bitPattern: prevCpuInfo[Int(CPU_STATE_MAX * i + CPU_STATE_IDLE)])
+            var userTicks: UInt64 = 0
+            var systemTicks: UInt64 = 0
+            var niceTicks: UInt64 = 0
+            var idleTicks: UInt64 = 0
+            
+            for i in 0 ..< Int32(self.numCPUs) {
+                let base = Int(CPU_STATE_MAX * i)
+                let user = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_USER)])
+                let system = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_SYSTEM)])
+                let nice = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_NICE)])
+                let idle = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_IDLE)])
+                
+                userTicks &+= UInt64(user)
+                systemTicks &+= UInt64(system)
+                niceTicks &+= UInt64(nice)
+                idleTicks &+= UInt64(idle)
+                
+                if let prevCpuInfo = self.prevCpuInfo {
+                    let dUser = user &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_USER)])
+                    let dSystem = system &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_SYSTEM)])
+                    let dNice = nice &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_NICE)])
+                    let dIdle = idle &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_IDLE)])
                     
-                    let inUse = UInt64(user) + UInt64(system) + UInt64(nice)
-                    let total = inUse + UInt64(idle)
+                    let inUse = UInt64(dUser) + UInt64(dSystem) + UInt64(dNice)
+                    let total = inUse + UInt64(dIdle)
                     if total != 0 {
                         self.usagePerCore.append(min(1, Double(inUse) / Double(total)))
                     }
@@ -91,73 +121,89 @@ internal class LoadReader: Reader<CPU_Load> {
             
             self.cpuInfo = nil
             self.numCpuInfo = 0
+            
+            // the aggregate load is the sum of the per-core ticks, so it is calculated from the
+            // values already fetched above instead of making a second host_statistics call
+            let userDiff = Double(userTicks) - self.prevTotalTicks.user
+            let sysDiff = Double(systemTicks) - self.prevTotalTicks.system
+            let niceDiff = Double(niceTicks) - self.prevTotalTicks.nice
+            let idleDiff = Double(idleTicks) - self.prevTotalTicks.idle
+            let totalTicks = sysDiff + userDiff + niceDiff + idleDiff
+            
+            let system = sysDiff / totalTicks
+            let user = userDiff / totalTicks
+            let idle = idleDiff / totalTicks
+            
+            if !system.isNaN {
+                self.response.systemLoad  = system
+            }
+            if !user.isNaN {
+                self.response.userLoad = user
+            }
+            if !idle.isNaN {
+                self.response.idleLoad = idle
+            }
+            self.prevTotalTicks = (user: Double(userTicks), system: Double(systemTicks), idle: Double(idleTicks), nice: Double(niceTicks))
         } else {
             error("host_processor_info(): \(String(cString: mach_error_string(result), encoding: String.Encoding.ascii) ?? "unknown error")", log: self.log)
-        }
-        
-        let cpuInfo = hostCPULoadInfo()
-        if cpuInfo == nil {
-            self.CPUUsageLock.unlock()
-            self.callback(nil)
-            return
-        }
-        
-        let userDiff = Double(cpuInfo!.cpu_ticks.0 &- self.previousInfo.cpu_ticks.0)
-        let sysDiff  = Double(cpuInfo!.cpu_ticks.1 &- self.previousInfo.cpu_ticks.1)
-        let idleDiff = Double(cpuInfo!.cpu_ticks.2 &- self.previousInfo.cpu_ticks.2)
-        let niceDiff = Double(cpuInfo!.cpu_ticks.3 &- self.previousInfo.cpu_ticks.3)
-        let totalTicks = sysDiff + userDiff + niceDiff + idleDiff
-        
-        let system = sysDiff / totalTicks
-        let user = userDiff / totalTicks
-        let idle = idleDiff / totalTicks
-        
-        if !system.isNaN {
-            self.response.systemLoad  = system
-        }
-        if !user.isNaN {
-            self.response.userLoad = user
-        }
-        if !idle.isNaN {
-            self.response.idleLoad = idle
-        }
-        self.previousInfo = cpuInfo!
-        self.response.totalUsage = self.response.systemLoad + self.response.userLoad
-        
-        if let cores = self.cores {
-            let eCoresList: [Double] = cores.filter({ $0.type == .efficiency }).enumerated().compactMap { (i, c) -> Double? in
-                if self.response.usagePerCore.indices.contains(Int(c.id)) {
-                    return self.response.usagePerCore[Int(c.id)]
-                }
-                return i < self.usagePerCore.count ? self.usagePerCore[i] : 0
-            }
-            let pCoresList: [Double] = cores.filter({ $0.type == .performance }).enumerated().compactMap { (i, c) -> Double? in
-                if self.response.usagePerCore.indices.contains(Int(c.id)) {
-                    return self.response.usagePerCore[Int(c.id)]
-                }
-                return i < self.usagePerCore.count ? self.usagePerCore[i] : 0
-            }
-            let sCoresList: [Double] = cores.filter({ $0.type == .super }).enumerated().compactMap { (i, c) -> Double? in
-                if self.response.usagePerCore.indices.contains(Int(c.id)) {
-                    return self.response.usagePerCore[Int(c.id)]
-                }
-                return i < self.usagePerCore.count ? self.usagePerCore[i] : 0
+            
+            let cpuInfo = hostCPULoadInfo()
+            if cpuInfo == nil {
+                self.CPUUsageLock.unlock()
+                self.callback(nil)
+                return
             }
             
-            if !eCoresList.isEmpty {
-                self.response.usageECores = eCoresList.reduce(0, +)/Double(eCoresList.count)
+            let userDiff = Double(cpuInfo!.cpu_ticks.0 &- self.previousInfo.cpu_ticks.0)
+            let sysDiff  = Double(cpuInfo!.cpu_ticks.1 &- self.previousInfo.cpu_ticks.1)
+            let idleDiff = Double(cpuInfo!.cpu_ticks.2 &- self.previousInfo.cpu_ticks.2)
+            let niceDiff = Double(cpuInfo!.cpu_ticks.3 &- self.previousInfo.cpu_ticks.3)
+            let totalTicks = sysDiff + userDiff + niceDiff + idleDiff
+            
+            let system = sysDiff / totalTicks
+            let user = userDiff / totalTicks
+            let idle = idleDiff / totalTicks
+            
+            if !system.isNaN {
+                self.response.systemLoad  = system
             }
-            if !pCoresList.isEmpty {
-                self.response.usagePCores = pCoresList.reduce(0, +)/Double(pCoresList.count)
+            if !user.isNaN {
+                self.response.userLoad = user
             }
-            if !sCoresList.isEmpty {
-                self.response.usageSCores = sCoresList.reduce(0, +)/Double(sCoresList.count)
+            if !idle.isNaN {
+                self.response.idleLoad = idle
             }
+            self.previousInfo = cpuInfo!
+        }
+        
+        self.response.totalUsage = self.response.systemLoad + self.response.userLoad
+        
+        if let value = self.clusterUsage(self.clusterIndexes.e) {
+            self.response.usageECores = value
+        }
+        if let value = self.clusterUsage(self.clusterIndexes.p) {
+            self.response.usagePCores = value
+        }
+        if let value = self.clusterUsage(self.clusterIndexes.s) {
+            self.response.usageSCores = value
         }
         
         let response = self.response
         self.CPUUsageLock.unlock()
         self.callback(response)
+    }
+    
+    private func clusterUsage(_ indexes: [(id: Int, position: Int)]) -> Double? {
+        guard !indexes.isEmpty else { return nil }
+        var total: Double = 0
+        for c in indexes {
+            if self.response.usagePerCore.indices.contains(c.id) {
+                total += self.response.usagePerCore[c.id]
+            } else if c.position < self.usagePerCore.count {
+                total += self.usagePerCore[c.position]
+            }
+        }
+        return total / Double(indexes.count)
     }
     
     private func hostCPULoadInfo() -> host_cpu_load_info? {
@@ -186,10 +232,22 @@ public class ProcessReader: Reader<[TopProcess]> {
         get { Store.shared.int(key: "\(self.title)_processes", defaultValue: 8) }
     }
     
+    private var previous: [Int32: (user: UInt64, system: UInt64)] = [:]
+    private var previousRead: DispatchTime? = nil
+    private var nameCache: [Int32: (ts: TimeInterval, command: String)] = [:]
+    
     public override func setup() {
         self.popup = true
         self.preview = true
         self.setInterval(Store.shared.int(key: "\(self.title)_updateTopInterval", defaultValue: 1))
+    }
+    
+    public override func start() {
+        super.start()
+        // the CPU usage is calculated from the diff between two reads, so after a pause
+        // the baseline is dropped and the next read falls back to the instant ps values
+        self.previous = [:]
+        self.previousRead = nil
     }
     
     public override func read() {
@@ -197,9 +255,92 @@ public class ProcessReader: Reader<[TopProcess]> {
             return
         }
         
+        // in-process sampling via libproc (no fork/exec of ps); falls back to ps on failure
+        // or on the first read, when no baseline for the diff exists yet
+        if let processes = self.readLocalProcesses() {
+            self.callback(processes)
+        } else {
+            self.callback(self.readWithPs())
+        }
+    }
+    
+    private func readLocalProcesses() -> [TopProcess]? {
+        let now = DispatchTime.now()
+        guard let pids = listAllPids() else { return nil }
+        
+        var elapsed: Double = 0
+        if let prev = self.previousRead {
+            elapsed = Double(now.uptimeNanoseconds - prev.uptimeNanoseconds) / 1_000_000_000
+            guard elapsed > 0 else { return nil }
+        }
+        
+        var current: [Int32: (user: UInt64, system: UInt64)] = [:]
+        current.reserveCapacity(pids.count)
+        var list: [(pid: Int32, usage: Double)] = []
+        list.reserveCapacity(pids.count)
+        
+        for pid in pids {
+            var info = proc_taskinfo()
+            guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else {
+                continue
+            }
+            let cpu = (user: info.pti_total_user, system: info.pti_total_system)
+            current[pid] = cpu
+            
+            guard elapsed > 0, let prev = self.previous[pid], cpu.user >= prev.user, cpu.system >= prev.system else {
+                continue
+            }
+            let usedNs = (cpu.user - prev.user) + (cpu.system - prev.system)
+            list.append((pid, Double(usedNs) / 1_000_000_000 / elapsed * 100))
+        }
+        
+        self.previous = current
+        self.previousRead = now
+        
+        guard elapsed > 0 else { return nil }
+        
+        list.sort { $0.usage > $1.usage }
+        
+        var processes: [TopProcess] = []
+        processes.reserveCapacity(min(self.numberOfProcesses, list.count))
+        for item in list.prefix(self.numberOfProcesses) {
+            processes.append(TopProcess(pid: Int(item.pid), name: self.processName(item.pid), usage: item.usage))
+        }
+        return processes
+    }
+    
+    private func processName(_ pid: Int32) -> String {
+        if pid == 0 {
+            return "kernel_task"
+        }
+        
+        let now = Date().timeIntervalSince1970
+        var command: String
+        if let cached = self.nameCache[pid], now - cached.ts < 30 {
+            command = cached.command
+        } else {
+            command = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+            self.nameCache[pid] = (now, command)
+            if self.nameCache.count > 2048 {
+                self.nameCache = [:]
+            }
+        }
+        
+        var name: String = command
+        if let app = NSRunningApplication(processIdentifier: pid), let n = app.localizedName {
+            name = n
+        }
+        if command.contains("com.apple.Virtua") && name.contains("Docker") {
+            name = "Docker"
+        }
+        
+        return name
+    }
+    
+    private func readWithPs() -> [TopProcess] {
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-Aceo pid,pcpu,comm", "-r"]
+        task.arguments = ["-Aceo", "pid,pcpu,comm", "-r"]
         
         let outputPipe = Pipe()
         let errorPipe = Pipe()
@@ -216,14 +357,14 @@ public class ProcessReader: Reader<[TopProcess]> {
             try task.run()
         } catch let err {
             error("error read ps: \(err.localizedDescription)", log: self.log)
-            return
+            return []
         }
         
         let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
         let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
         let output = String(data: outputData, encoding: .utf8)
         _ = String(data: errorData, encoding: .utf8)
-        guard let output, !output.isEmpty else { return }
+        guard let output, !output.isEmpty else { return [] }
         
         var index = 0
         var processes: [TopProcess] = []
@@ -251,7 +392,7 @@ public class ProcessReader: Reader<[TopProcess]> {
             index += 1
         }
         
-        self.callback(processes)
+        return processes
     }
 }
 
