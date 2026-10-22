@@ -114,9 +114,18 @@ public class ProcessReader: Reader<[TopProcess]> {
         get { Store.shared.bool(key: "\(self.title)_combinedProcesses", defaultValue: false) }
     }
     
+    private var legacyReader: Bool {
+        get { Store.shared.bool(key: "\(self.title)_processesLegacyReader", defaultValue: false) }
+    }
+    
     private typealias dynGetResponsiblePidFuncType = @convention(c) (CInt) -> CInt
     
     private var nameCache: [Int32: (ts: TimeInterval, command: String)] = [:]
+    
+    // processes of other users (root daemons, WindowServer, kernel_task...) cannot be read with
+    // libproc without privileges, their memory comes from the setuid top, refreshed less often
+    private var privileged: (ts: DispatchTime, combined: Bool, list: [TopProcess])? = nil
+    private let privilegedInterval: Double = 5
     
     public override func setup() {
         self.popup = true
@@ -124,13 +133,20 @@ public class ProcessReader: Reader<[TopProcess]> {
         self.setInterval(Store.shared.int(key: "\(self.title)_updateTopInterval", defaultValue: 1))
     }
     
+    public override func start() {
+        self.privileged = nil
+        super.start()
+    }
+    
     public override func read() {
         if self.numberOfProcesses == 0 {
             return
         }
         
-        // in-process sampling via libproc (no fork/exec of top); falls back to top on failure
-        let processes = self.readLocalProcesses() ?? self.readWithTop()
+        // legacy reader (settings): top for all the processes on every read. otherwise in-process
+        // sampling via libproc (no fork/exec of top) merged with top for the processes libproc
+        // cannot read; falls back to top on failure
+        let processes = self.legacyReader ? self.readWithTop() : (self.readLocalProcesses() ?? self.readWithTop())
         
         if !self.combinedProcesses {
             self.callback(processes)
@@ -176,8 +192,9 @@ public class ProcessReader: Reader<[TopProcess]> {
     private func readLocalProcesses() -> [TopProcess]? {
         guard let pids = listAllPids() else { return nil }
         
-        var list: [(pid: Int32, usage: Double)] = []
+        var list: [(pid: Int32, usage: Double, name: String?)] = []
         list.reserveCapacity(pids.count)
+        var inaccessible: Set<Int32> = []
         for pid in pids {
             var usage = rusage_info_current()
             let result = withUnsafeMutablePointer(to: &usage) {
@@ -185,11 +202,18 @@ public class ProcessReader: Reader<[TopProcess]> {
                     proc_pid_rusage(pid, RUSAGE_INFO_CURRENT, $0)
                 }
             }
-            guard result != -1 else { continue }
-            list.append((pid, Double(usage.ri_resident_size)))
+            guard result != -1 else {
+                inaccessible.insert(pid)
+                continue
+            }
+            // physical memory footprint, the value shown by top's mem column
+            list.append((pid, Double(usage.ri_phys_footprint), nil))
         }
         guard !list.isEmpty else { return nil }
         
+        for process in self.privilegedProcesses(inaccessible) {
+            list.append((Int32(process.pid), process.usage, process.name))
+        }
         list.sort { $0.usage > $1.usage }
         
         // in combined mode all processes are needed for the grouping by responsible pid
@@ -197,9 +221,23 @@ public class ProcessReader: Reader<[TopProcess]> {
         var processes: [TopProcess] = []
         processes.reserveCapacity(min(limit, list.count))
         for item in list.prefix(limit) {
-            processes.append(TopProcess(pid: Int(item.pid), name: self.processName(item.pid), usage: item.usage))
+            processes.append(TopProcess(pid: Int(item.pid), name: item.name ?? self.processName(item.pid), usage: item.usage))
         }
         return processes
+    }
+    
+    private func privilegedProcesses(_ pids: Set<Int32>) -> [TopProcess] {
+        guard !pids.isEmpty else { return [] }
+        let now = DispatchTime.now()
+        let combined = self.combinedProcesses
+        if let cached = self.privileged, cached.combined == combined,
+           Double(now.uptimeNanoseconds - cached.ts.uptimeNanoseconds) / 1_000_000_000 < self.privilegedInterval {
+            return cached.list.filter { pids.contains(Int32($0.pid)) }
+        }
+        // top returns the processes of all users, the ones libproc could read are dropped
+        let list = self.readWithTop()
+        self.privileged = (now, combined, list)
+        return list.filter { pids.contains(Int32($0.pid)) }
     }
     
     private func processName(_ pid: Int32) -> String {
@@ -208,7 +246,7 @@ public class ProcessReader: Reader<[TopProcess]> {
         if let cached = self.nameCache[pid], now - cached.ts < 30 {
             command = cached.command
         } else {
-            command = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+            command = processDisplayName(pid) ?? "\(pid)"
             self.nameCache[pid] = (now, command)
             if self.nameCache.count > 2048 {
                 self.nameCache = [:]

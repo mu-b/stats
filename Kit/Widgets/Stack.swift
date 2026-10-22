@@ -233,11 +233,15 @@ public class StackWidget: WidgetWrapper {
     public func setValues(_ values: [Stack_t]) {
         DispatchQueue.main.async(execute: {
             var tableNeedsToBeUpdated: Bool = false
+            var valuesChanged: Bool = false
             
             self.queue.sync {
                 values.forEach { (p: Stack_t) in
                     if let idx = self.values.firstIndex(where: { $0.key == p.key }) {
-                        self.values[idx].value = p.value
+                        if self.values[idx].value != p.value {
+                            self.values[idx].value = p.value
+                            valuesChanged = true
+                        }
                         return
                     }
                     tableNeedsToBeUpdated = true
@@ -254,7 +258,10 @@ public class StackWidget: WidgetWrapper {
             if tableNeedsToBeUpdated {
                 self.orderTableView.update()
             }
-            self.needsDisplay = true
+            // redraw only when something changed, the formatted values often stay the same between reads
+            if tableNeedsToBeUpdated || valuesChanged {
+                self.needsDisplay = true
+            }
         })
     }
     

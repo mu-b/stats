@@ -266,6 +266,7 @@
 "Scale value" = "Giá trị tỷ lệ";
 "Text widget value" = "Giá trị widget văn bản"; // gemma4:31b
 "Combined processes" = "Gộp các tiến trình"; // gemma4:31b
+"Use ps/top for top processes" = "Dùng ps/top cho các tiến trình hàng đầu";
 
 // CPU
 "CPU usage" = "Sử dụng CPU";

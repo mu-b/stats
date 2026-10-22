@@ -266,6 +266,7 @@
 "Scale value" = "قيمة المقياس";
 "Text widget value" = "قيمة أداة النص"; // gemma4:31b
 "Combined processes" = "عمليات مجمعة"; // gemma4:31b
+"Use ps/top for top processes" = "استخدم ps/top لأعلى العمليات";
 
 // CPU
 "CPU usage" = "استخدام المعالج";

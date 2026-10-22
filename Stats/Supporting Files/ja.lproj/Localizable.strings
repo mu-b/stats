@@ -266,6 +266,7 @@
 "Scale value" = "スケール値"; // translategemma:4b
 "Text widget value" = "テキストウィジェットの値"; // translategemma:4b
 "Combined processes" = "統合されたプロセス"; // translategemma:4b
+"Use ps/top for top processes" = "上位プロセスに ps/top を使用";
 
 // CPU
 "CPU usage" = "CPU 使用率";

@@ -266,6 +266,7 @@
 "Scale value" = "스케일 값";
 "Text widget value" = "텍스트 위젯 값"; // translategemma:4b
 "Combined processes" = "통합된 프로세스"; // translategemma:4b
+"Use ps/top for top processes" = "상위 프로세스에 ps/top 사용";
 
 // CPU
 "CPU usage" = "CPU 사용량";

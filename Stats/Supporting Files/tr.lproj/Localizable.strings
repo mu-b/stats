@@ -266,6 +266,7 @@
 "Scale value" = "Ölçek değeri";
 "Text widget value" = "Metin widget'ı değeri";
 "Combined processes" = "Birleşik işlemler"; // gemma4:31b
+"Use ps/top for top processes" = "En yoğun işlemler için ps/top kullan";
 
 // CPU
 "CPU usage" = "CPU kullanımı";

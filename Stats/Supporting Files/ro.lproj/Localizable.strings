@@ -266,6 +266,7 @@
 "Scale value" = "Valoarea scalei"; // gemma4:31b
 "Text widget value" = "Valoarea widgetului de text"; // gemma4:31b
 "Combined processes" = "Procese grupate"; // gemma4:31b
+"Use ps/top for top processes" = "Folosește ps/top pentru procesele de vârf";
 
 // CPU
 "CPU usage" = "Utilizarea procesorului";

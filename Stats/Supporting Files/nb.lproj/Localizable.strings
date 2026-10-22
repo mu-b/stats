@@ -266,6 +266,7 @@
 "Scale value" = "Skalaverdi"; // translategemma:4b
 "Text widget value" = "Verdi for tekstwidget"; // gemma4:31b
 "Combined processes" = "Kombinerte prosesser"; // translategemma:4b
+"Use ps/top for top processes" = "Bruk ps/top for topp-prosesser";
 
 // CPU
 "CPU usage" = "CPU-bruk";

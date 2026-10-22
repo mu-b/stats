@@ -266,6 +266,7 @@
 "Scale value" = "Τιμή κλίμακας"; // translategemma:4b
 "Text widget value" = "Τιμή του ουίντζετ κειμένου"; // gemma4:31b
 "Combined processes" = "Ομαδοποιημένες διαδικασίες"; // gemma4:31b
+"Use ps/top for top processes" = "Χρήση ps/top για τις κορυφαίες διεργασίες";
 
 // CPU
 "CPU usage" = "Χρήση CPU";

@@ -266,6 +266,7 @@
 "Scale value" = "அளவு மதிப்பு";
 "Text widget value" = "உரை விட்ஜெட் மதிப்பு";
 "Combined processes" = "ஒன்றிணைக்கப்பட்ட செயல்முறைகள்";
+"Use ps/top for top processes" = "முதன்மை செயல்முறைகளுக்கு ps/top பயன்படுத்தவும்";
 
 // CPU
 "CPU usage" = "மையச் செயலக பயன்பாடு";

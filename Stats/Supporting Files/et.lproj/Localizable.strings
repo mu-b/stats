@@ -266,6 +266,7 @@
 "Scale value" = "Mõõtühiku väärtus";
 "Text widget value" = "Teksti atribuudi väärtus";
 "Combined processes" = "Grupeeritud protsessid"; // gemma4:31b
+"Use ps/top for top processes" = "Kasuta ps/top tipp-protsesside jaoks";
 
 // CPU
 "CPU usage" = "CPU kasutus";

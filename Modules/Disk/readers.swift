@@ -504,6 +504,13 @@ public class ProcessReader: Reader<[Disk_process]> {
         self.setInterval(1)
     }
     
+    public override func start() {
+        // the IO is calculated from the diff between two reads, so after a pause the baseline is
+        // dropped instead of reporting everything accumulated while the popup was closed
+        self.list = [:]
+        super.start()
+    }
+    
     public override func read() {
         guard self.numberOfProcesses != 0 else { return }
         
@@ -528,7 +535,10 @@ public class ProcessReader: Reader<[Disk_process]> {
     private func readLocalProcesses() -> [Disk_process]? {
         guard let pids = listAllPids() else { return nil }
         
-        var snapshot = self.list
+        // a fresh snapshot per read, so exited processes are dropped and a reused pid starts a new baseline
+        let previous = self.list
+        var snapshot: [Int32: io] = [:]
+        snapshot.reserveCapacity(pids.count)
         var processes: [Disk_process] = []
         
         for pid in pids {
@@ -543,7 +553,7 @@ public class ProcessReader: Reader<[Disk_process]> {
             let bytesRead = Int(clamping: usage.ri_diskio_bytesread)
             let bytesWritten = Int(clamping: usage.ri_diskio_byteswritten)
             
-            if let v = snapshot[pid] {
+            if let v = previous[pid], bytesRead >= v.read, bytesWritten >= v.write {
                 let read = bytesRead - v.read
                 let write = bytesWritten - v.write
                 if read != 0 || write != 0 {
@@ -563,7 +573,7 @@ public class ProcessReader: Reader<[Disk_process]> {
         if let cached = self.nameCache[pid], now - cached.ts < 30 {
             return cached.name
         }
-        let name = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+        let name = processDisplayName(pid) ?? "\(pid)"
         self.nameCache[pid] = (now, name)
         if self.nameCache.count > 2048 {
             self.nameCache = [:]
@@ -574,7 +584,8 @@ public class ProcessReader: Reader<[Disk_process]> {
     private func readWithPs() -> [Disk_process]? {
         guard let output = runProcess(path: "/bin/ps", args: ["-Aceo", "pid,args", "-r"]) else { return nil }
         
-        var snapshot = self.list
+        let previous = self.list
+        var snapshot: [Int32: io] = [:]
         var processes: [Disk_process] = []
         output.enumerateLines { (line, _) in
             let str = line.trimmingCharacters(in: .whitespaces)
@@ -593,11 +604,7 @@ public class ProcessReader: Reader<[Disk_process]> {
             let bytesRead = Int(clamping: usage.ri_diskio_bytesread)
             let bytesWritten = Int(clamping: usage.ri_diskio_byteswritten)
             
-            if snapshot[pid] == nil {
-                snapshot[pid] = io(read: bytesRead, write: bytesWritten)
-            }
-            
-            if let v = snapshot[pid] {
+            if let v = previous[pid], bytesRead >= v.read, bytesWritten >= v.write {
                 let read = bytesRead - v.read
                 let write = bytesWritten - v.write
                 if read != 0 || write != 0 {
@@ -605,8 +612,7 @@ public class ProcessReader: Reader<[Disk_process]> {
                 }
             }
             
-            snapshot[pid]?.read = bytesRead
-            snapshot[pid]?.write = bytesWritten
+            snapshot[pid] = io(read: bytesRead, write: bytesWritten)
         }
         self.list = snapshot
         

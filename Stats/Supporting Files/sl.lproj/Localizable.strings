@@ -266,6 +266,7 @@
 "Scale value" = "Vrednost skale";
 "Text widget value" = "Vrednost besedilnega pripomočka";
 "Combined processes" = "Združeni procesi"; // gemma4:31b
+"Use ps/top for top processes" = "Uporabi ps/top za najaktivnejše procese";
 
 // CPU
 "CPU usage" = "CPU poraba";

@@ -266,6 +266,7 @@
 "Scale value" = "ערך קנה מידה"; // gemma4:31b
 "Text widget value" = "ערך ווידג'ט טקסט"; // gemma4:31b
 "Combined processes" = "תהליכים מאוחדים"; // gemma4:31b
+"Use ps/top for top processes" = "השתמש ב-ps/top עבור התהליכים המובילים";
 
 // CPU
 "CPU usage" = "שימוש המעבד";

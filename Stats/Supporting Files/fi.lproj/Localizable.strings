@@ -266,6 +266,7 @@
 "Scale value" = "Skaalausarvo";
 "Text widget value" = "Tekstiwidgetin arvo"; // gemma4:31b
 "Combined processes" = "Yhdistetyt prosessit"; // translategemma:4b
+"Use ps/top for top processes" = "Käytä ps/top-komentoa eniten kuormittaville prosesseille";
 
 // CPU
 "CPU usage" = "Suorittimen käyttö";

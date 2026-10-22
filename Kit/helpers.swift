@@ -1010,10 +1010,11 @@ internal class WidgetLabelView: NSView {
 public func listAllPids() -> [pid_t]? {
     let count = proc_listallpids(nil, 0)
     guard count > 0 else { return nil }
-    var pids = [pid_t](repeating: 0, count: Int(count))
-    let result = proc_listallpids(&pids, count)
+    // the buffer size is passed in bytes, with headroom for processes spawned between the two calls
+    var pids = [pid_t](repeating: 0, count: Int(count) + 64)
+    let result = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride))
     guard result > 0 else { return nil }
-    return Array(pids[0..<Int(result)])
+    return Array(pids.prefix(Int(result)))
 }
 
 /// Full executable path of a process, nil when it cannot be read.
@@ -1028,6 +1029,14 @@ public func processShortName(_ pid: pid_t) -> String? {
     var buffer = [CChar](repeating: 0, count: 1024)
     guard proc_name(pid, &buffer, 1024) > 0 else { return nil }
     return String(cString: buffer)
+}
+
+/// Executable name of a process (as shown by ps -c), nil when it cannot be read.
+public func processDisplayName(_ pid: pid_t) -> String? {
+    if let path = processPath(pid) {
+        return (path as NSString).lastPathComponent
+    }
+    return processShortName(pid)
 }
 
 public func process(path: String, arguments: [String]) -> String? {

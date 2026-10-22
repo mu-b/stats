@@ -25,6 +25,22 @@ public class Sensors: Module {
     
     private var selectedSensor: String
     
+    // keys of the sensors enabled in the widgets, cached instead of a Store lookup per sensor on
+    // every read. invalidated when a sensor is toggled, rebuilt when the sensors list changes
+    private let enabledSensorsLock = NSLock()
+    private var _enabledSensors: (count: Int, keys: Set<String>)? = nil
+    
+    private func enabledSensors(_ sensors: [Sensor_p]) -> Set<String> {
+        self.enabledSensorsLock.lock()
+        defer { self.enabledSensorsLock.unlock() }
+        if let cached = self._enabledSensors, cached.count == sensors.count {
+            return cached.keys
+        }
+        let keys = Set(sensors.filter({ $0.state }).map({ $0.key }))
+        self._enabledSensors = (sensors.count, keys)
+        return keys
+    }
+    
     public init() {
         self.settingsView = Settings(.sensors)
         self.popupView = Popup()
@@ -51,6 +67,7 @@ public class Sensors: Module {
         self.notificationsView.setup(self.sensorsReader?.list.sensors)
         
         self.settingsView.callback = { [weak self] in
+            self?.resetEnabledSensors()
             self?.sensorsReader?.read()
         }
         self.settingsView.setInterval = { [weak self] value in
@@ -59,6 +76,7 @@ public class Sensors: Module {
         self.settingsView.HIDcallback = { [weak self] in
             DispatchQueue.global(qos: .background).async {
                 self?.sensorsReader?.HIDCallback()
+                self?.resetEnabledSensors()
                 DispatchQueue.main.async {
                     self?.popupView.setup(self?.sensorsReader?.list.sensors)
                     self?.portalView.setup(self?.sensorsReader?.list.sensors)
@@ -70,6 +88,7 @@ public class Sensors: Module {
         self.settingsView.unknownCallback = { [weak self] in
             DispatchQueue.global(qos: .background).async {
                 self?.sensorsReader?.unknownCallback()
+                self?.resetEnabledSensors()
                 DispatchQueue.main.async {
                     self?.popupView.setup(self?.sensorsReader?.list.sensors)
                     self?.portalView.setup(self?.sensorsReader?.list.sensors)
@@ -97,6 +116,12 @@ public class Sensors: Module {
                 }
             }
         }
+    }
+    
+    private func resetEnabledSensors() {
+        self.enabledSensorsLock.lock()
+        defer { self.enabledSensorsLock.unlock() }
+        self._enabledSensors = nil
     }
     
     private func usageCallback(_ raw: Sensors_List?) {
@@ -127,12 +152,14 @@ public class Sensors: Module {
                 }
             case let widget as StackWidget:
                 var list: [Stack_t] = []
+                let enabled = self.enabledSensors(value.sensors)
+                let fanPercentage = self.fanValueState == .percentage
                 
                 value.sensors.forEach { (s: Sensor_p) in
-                    if s.state {
+                    if enabled.contains(s.key) {
                         var value = s.formattedMiniValue
                         if let f = s as? Fan {
-                            if self.fanValueState == .percentage {
+                            if fanPercentage {
                                 value = "\(f.percentage)%"
                             }
                         }
@@ -143,8 +170,9 @@ public class Sensors: Module {
                 widget.setValues(list)
             case let widget as BarChart:
                 var flatList: [[ColorValue]] = []
-                value.sensors.filter{ $0 is Fan }.forEach { (s: Sensor_p) in
-                    if s.state, let f = s as? Fan {
+                let enabled = self.enabledSensors(value.sensors)
+                value.sensors.forEach { (s: Sensor_p) in
+                    if let f = s as? Fan, enabled.contains(s.key) {
                         flatList.append([ColorValue(Double(f.percentage) / 100)])
                     }
                 }

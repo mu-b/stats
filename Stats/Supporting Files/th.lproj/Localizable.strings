@@ -266,6 +266,7 @@
 "Scale value" = "ค่ามาตราส่วน"; // gemma4:31b
 "Text widget value" = "ค่าของวิดเจ็ตข้อความ"; // gemma4:31b
 "Combined processes" = "รวมกระบวนการ"; // gemma4:31b
+"Use ps/top for top processes" = "ใช้ ps/top สำหรับกระบวนการสูงสุด";
 
 // CPU
 "CPU usage" = "การใช้งาน CPU";

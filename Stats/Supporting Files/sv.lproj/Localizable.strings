@@ -266,6 +266,7 @@
 "Scale value" = "Skalvärde";
 "Text widget value" = "Värde för textwidget"; // gemma4:31b
 "Combined processes" = "Grupperade processer"; // gemma4:31b
+"Use ps/top for top processes" = "Använd ps/top för topprocesser";
 
 // CPU
 "CPU usage" = "CPU-användning";

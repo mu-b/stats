@@ -266,6 +266,7 @@
 "Scale value" = "स्केल मान"; // gemma4:31b
 "Text widget value" = "टेक्स्ट विजेट का मान"; // translategemma:4b
 "Combined processes" = "संयुक्त प्रक्रियाएं"; // translategemma:4b
+"Use ps/top for top processes" = "शीर्ष प्रक्रियाओं के लिए ps/top का उपयोग करें";
 
 // CPU
 "CPU usage" = "सीपीयू उपयोग";

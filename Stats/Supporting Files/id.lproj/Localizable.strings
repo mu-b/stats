@@ -266,6 +266,7 @@
 "Scale value" = "Nilai skala"; // translategemma:4b
 "Text widget value" = "Nilai widget teks"; // translategemma:4b
 "Combined processes" = "Proses gabungan"; // gemma4:31b
+"Use ps/top for top processes" = "Gunakan ps/top untuk proses teratas";
 
 // CPU
 "CPU usage" = "Penggunaan CPU";

@@ -266,6 +266,7 @@
 "Scale value" = "Hodnota škály"; // gemma4:31b
 "Text widget value" = "Hodnota textového vidžetu"; // gemma4:31b
 "Combined processes" = "Zeskupené procesy"; // gemma4:31b
+"Use ps/top for top processes" = "Použiť ps/top pre najvyťaženejšie procesy";
 
 // CPU
 "CPU usage" = "Použitie CPU";

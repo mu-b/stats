@@ -266,6 +266,7 @@
 "Scale value" = "Scale value";
 "Text widget value" = "Text widget value";
 "Combined processes" = "Combined processes";
+"Use ps/top for top processes" = "Use ps/top for top processes";
 
 // CPU
 "CPU usage" = "CPU usage";

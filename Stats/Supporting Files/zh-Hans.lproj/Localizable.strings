@@ -266,6 +266,7 @@
 "Scale value" = "缩放值";
 "Text widget value" = "文本小组件值";
 "Combined processes" = "合并进程"; // gemma4:31b
+"Use ps/top for top processes" = "使用 ps/top 获取高占用进程";
 
 // CPU
 "CPU usage" = "CPU占用";

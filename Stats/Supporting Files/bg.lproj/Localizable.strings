@@ -266,6 +266,7 @@
 "Scale value" = "Стойност на мащаба"; // translategemma:4b
 "Text widget value" = "Стойност на текстовия виджет"; // gemma4:31b
 "Combined processes" = "Групирани процеси"; // gemma4:31b
+"Use ps/top for top processes" = "Използвай ps/top за топ процесите";
 
 // CPU
 "CPU usage" = "Употреба на процесора";

@@ -266,6 +266,7 @@
 "Scale value" = "Valor de la escala";
 "Text widget value" = "Valor del widget de texto"; // translategemma:4b
 "Combined processes" = "Procesos agrupados"; // gemma4:31b
+"Use ps/top for top processes" = "Usar ps/top para los procesos principales";
 
 // CPU
 "CPU usage" = "Uso de la CPU";

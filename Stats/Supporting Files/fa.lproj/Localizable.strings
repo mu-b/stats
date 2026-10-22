@@ -266,6 +266,7 @@
 "Scale value" = "مقدار مقیاس"; // gemma4:31b
 "Text widget value" = "مقدار ویجت متنی"; // gemma4:31b
 "Combined processes" = "فرآیندهای تجمیع‌شده"; // gemma4:31b
+"Use ps/top for top processes" = "استفاده از ps/top برای بالاترین پردازش‌ها";
 
 // CPU
 "CPU usage" = "مصرف سی پی یو";

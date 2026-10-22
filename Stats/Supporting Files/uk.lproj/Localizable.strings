@@ -266,6 +266,7 @@
 "Scale value" = "Значення масштабування";
 "Text widget value" = "Значення текстового віджета";
 "Combined processes" = "Згруповані процеси";
+"Use ps/top for top processes" = "Використовувати ps/top для списку процесів";
 
 // CPU
 "CPU usage" = "Використання процесора";

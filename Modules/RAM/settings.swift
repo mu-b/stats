@@ -50,6 +50,7 @@ internal class Settings: NSStackView, Settings_v, NSTextFieldDelegate {
     private var notificationLevel: String = "Disabled"
     private var textValue: String = "$mem.used/$mem.total ($pressure.value)"
     private var combinedProcessesState: Bool = false
+    private var processesLegacyReaderState: Bool = false
     
     private let title: String
     
@@ -69,6 +70,7 @@ internal class Settings: NSStackView, Settings_v, NSTextFieldDelegate {
         self.notificationLevel = Store.shared.string(key: "\(self.title)_notificationLevel", defaultValue: self.notificationLevel)
         self.textValue = Store.shared.string(key: "\(self.title)_textWidgetValue", defaultValue: self.textValue)
         self.combinedProcessesState = Store.shared.bool(key: "\(self.title)_combinedProcesses", defaultValue: self.combinedProcessesState)
+        self.processesLegacyReaderState = Store.shared.bool(key: "\(self.title)_processesLegacyReader", defaultValue: self.processesLegacyReaderState)
         
         super.init(frame: NSRect.zero)
         
@@ -106,6 +108,10 @@ internal class Settings: NSStackView, Settings_v, NSTextFieldDelegate {
                 action: #selector(changeNumberOfProcesses),
                 items: NumbersOfProcesses.map{ KeyValue_t(key: "\($0)", value: "\($0)") },
                 selected: "\(self.numberOfProcesses)"
+            )),
+            PreferencesRow(localizedString("Use ps/top for top processes"), component: switchView(
+                action: #selector(toggleProcessesLegacyReader),
+                state: self.processesLegacyReaderState
             ))
         ]))
         
@@ -173,6 +179,10 @@ internal class Settings: NSStackView, Settings_v, NSTextFieldDelegate {
         self.combinedProcessesState = controlState(sender)
         Store.shared.set(key: "\(self.title)_combinedProcesses", value: self.combinedProcessesState)
         self.callback()
+    }
+    @objc private func toggleProcessesLegacyReader(_ sender: NSControl) {
+        self.processesLegacyReaderState = controlState(sender)
+        Store.shared.set(key: "\(self.title)_processesLegacyReader", value: self.processesLegacyReaderState)
     }
     
     func controlTextDidChange(_ notification: Notification) {

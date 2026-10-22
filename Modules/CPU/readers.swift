@@ -27,7 +27,6 @@ internal class LoadReader: Reader<CPU_Load> {
     private var usagePerCore: [Double] = []
     private var cores: [core_s]? = nil
     private var clusterIndexes: (e: [(id: Int, position: Int)], p: [(id: Int, position: Int)], s: [(id: Int, position: Int)]) = ([], [], [])
-    private var prevTotalTicks = (user: Double(0), system: Double(0), idle: Double(0), nice: Double(0))
     
     public override func setup() {
         self.hasHyperthreadingCores = sysctlByName("hw.physicalcpu") != sysctlByName("hw.logicalcpu")
@@ -64,6 +63,8 @@ internal class LoadReader: Reader<CPU_Load> {
             self.usagePerCore = []
             self.usagePerCore.reserveCapacity(Int(self.numCPUs))
             
+            // aggregate ticks over all cores: the sum of the wrapped per-core deltas, or the
+            // since-boot totals on the first read when no previous sample exists
             var userTicks: UInt64 = 0
             var systemTicks: UInt64 = 0
             var niceTicks: UInt64 = 0
@@ -76,22 +77,28 @@ internal class LoadReader: Reader<CPU_Load> {
                 let nice = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_NICE)])
                 let idle = UInt32(bitPattern: self.cpuInfo[base + Int(CPU_STATE_IDLE)])
                 
-                userTicks &+= UInt64(user)
-                systemTicks &+= UInt64(system)
-                niceTicks &+= UInt64(nice)
-                idleTicks &+= UInt64(idle)
+                guard let prevCpuInfo = self.prevCpuInfo else {
+                    userTicks &+= UInt64(user)
+                    systemTicks &+= UInt64(system)
+                    niceTicks &+= UInt64(nice)
+                    idleTicks &+= UInt64(idle)
+                    continue
+                }
                 
-                if let prevCpuInfo = self.prevCpuInfo {
-                    let dUser = user &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_USER)])
-                    let dSystem = system &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_SYSTEM)])
-                    let dNice = nice &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_NICE)])
-                    let dIdle = idle &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_IDLE)])
-                    
-                    let inUse = UInt64(dUser) + UInt64(dSystem) + UInt64(dNice)
-                    let total = inUse + UInt64(dIdle)
-                    if total != 0 {
-                        self.usagePerCore.append(min(1, Double(inUse) / Double(total)))
-                    }
+                let dUser = user &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_USER)])
+                let dSystem = system &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_SYSTEM)])
+                let dNice = nice &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_NICE)])
+                let dIdle = idle &- UInt32(bitPattern: prevCpuInfo[base + Int(CPU_STATE_IDLE)])
+                
+                userTicks &+= UInt64(dUser)
+                systemTicks &+= UInt64(dSystem)
+                niceTicks &+= UInt64(dNice)
+                idleTicks &+= UInt64(dIdle)
+                
+                let inUse = UInt64(dUser) + UInt64(dSystem) + UInt64(dNice)
+                let total = inUse + UInt64(dIdle)
+                if total != 0 {
+                    self.usagePerCore.append(min(1, Double(inUse) / Double(total)))
                 }
             }
             let showHyperthratedCores = Store.shared.bool(key: "CPU_hyperhreading", defaultValue: false)
@@ -124,10 +131,10 @@ internal class LoadReader: Reader<CPU_Load> {
             
             // the aggregate load is the sum of the per-core ticks, so it is calculated from the
             // values already fetched above instead of making a second host_statistics call
-            let userDiff = Double(userTicks) - self.prevTotalTicks.user
-            let sysDiff = Double(systemTicks) - self.prevTotalTicks.system
-            let niceDiff = Double(niceTicks) - self.prevTotalTicks.nice
-            let idleDiff = Double(idleTicks) - self.prevTotalTicks.idle
+            let userDiff = Double(userTicks)
+            let sysDiff = Double(systemTicks)
+            let niceDiff = Double(niceTicks)
+            let idleDiff = Double(idleTicks)
             let totalTicks = sysDiff + userDiff + niceDiff + idleDiff
             
             let system = sysDiff / totalTicks
@@ -143,7 +150,6 @@ internal class LoadReader: Reader<CPU_Load> {
             if !idle.isNaN {
                 self.response.idleLoad = idle
             }
-            self.prevTotalTicks = (user: Double(userTicks), system: Double(systemTicks), idle: Double(idleTicks), nice: Double(niceTicks))
         } else {
             error("host_processor_info(): \(String(cString: mach_error_string(result), encoding: String.Encoding.ascii) ?? "unknown error")", log: self.log)
             
@@ -231,23 +237,40 @@ public class ProcessReader: Reader<[TopProcess]> {
     private var numberOfProcesses: Int {
         get { Store.shared.int(key: "\(self.title)_processes", defaultValue: 8) }
     }
+    private var legacyReader: Bool {
+        get { Store.shared.bool(key: "\(self.title)_processesLegacyReader", defaultValue: false) }
+    }
     
     private var previous: [Int32: (user: UInt64, system: UInt64)] = [:]
     private var previousRead: DispatchTime? = nil
     private var nameCache: [Int32: (ts: TimeInterval, command: String)] = [:]
+    // pti_total_user/system are in mach absolute time units (not ns on Apple Silicon)
+    private var nsPerTick: Double = 1
+    
+    // processes of other users (root daemons, WindowServer, kernel_task...) cannot be read with
+    // libproc without privileges, their usage comes from the setuid ps, refreshed less often
+    private var privileged: (ts: DispatchTime, list: [TopProcess])? = nil
+    private let privilegedInterval: Double = 5
     
     public override func setup() {
         self.popup = true
         self.preview = true
         self.setInterval(Store.shared.int(key: "\(self.title)_updateTopInterval", defaultValue: 1))
+        
+        var timebase = mach_timebase_info_data_t()
+        if mach_timebase_info(&timebase) == KERN_SUCCESS && timebase.denom != 0 {
+            self.nsPerTick = Double(timebase.numer) / Double(timebase.denom)
+        }
     }
     
     public override func start() {
-        super.start()
         // the CPU usage is calculated from the diff between two reads, so after a pause
-        // the baseline is dropped and the next read falls back to the instant ps values
+        // the baseline is dropped and the next read falls back to the instant ps values.
+        // reset before super.start(), which may dispatch the first read immediately
         self.previous = [:]
         self.previousRead = nil
+        self.privileged = nil
+        super.start()
     }
     
     public override func read() {
@@ -255,13 +278,37 @@ public class ProcessReader: Reader<[TopProcess]> {
             return
         }
         
-        // in-process sampling via libproc (no fork/exec of ps); falls back to ps on failure
-        // or on the first read, when no baseline for the diff exists yet
+        // legacy reader (settings): ps for all the processes on every read
+        if self.legacyReader {
+            self.previous = [:]
+            self.previousRead = nil
+            self.callback(self.readWithPs())
+            return
+        }
+        
+        // in-process sampling via libproc (no fork/exec of ps) merged with ps for the processes
+        // libproc cannot read; falls back to ps on failure or on the first read, when no baseline
+        // for the diff exists yet
         if let processes = self.readLocalProcesses() {
             self.callback(processes)
         } else {
-            self.callback(self.readWithPs())
+            let processes = self.readWithPs()
+            self.privileged = (DispatchTime.now(), processes)
+            self.callback(processes)
         }
+    }
+    
+    private func privilegedProcesses(_ pids: Set<Int32>) -> [TopProcess] {
+        guard !pids.isEmpty else { return [] }
+        let now = DispatchTime.now()
+        if let cached = self.privileged,
+           Double(now.uptimeNanoseconds - cached.ts.uptimeNanoseconds) / 1_000_000_000 < self.privilegedInterval {
+            return cached.list.filter { pids.contains(Int32($0.pid)) }
+        }
+        // ps returns the top processes of all users, the ones libproc could read are dropped
+        let list = self.readWithPs()
+        self.privileged = (now, list)
+        return list.filter { pids.contains(Int32($0.pid)) }
     }
     
     private func readLocalProcesses() -> [TopProcess]? {
@@ -276,12 +323,14 @@ public class ProcessReader: Reader<[TopProcess]> {
         
         var current: [Int32: (user: UInt64, system: UInt64)] = [:]
         current.reserveCapacity(pids.count)
-        var list: [(pid: Int32, usage: Double)] = []
+        var list: [(pid: Int32, usage: Double, name: String?)] = []
         list.reserveCapacity(pids.count)
+        var inaccessible: Set<Int32> = []
         
         for pid in pids {
             var info = proc_taskinfo()
             guard proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.size)) > 0 else {
+                inaccessible.insert(pid)
                 continue
             }
             let cpu = (user: info.pti_total_user, system: info.pti_total_system)
@@ -290,8 +339,9 @@ public class ProcessReader: Reader<[TopProcess]> {
             guard elapsed > 0, let prev = self.previous[pid], cpu.user >= prev.user, cpu.system >= prev.system else {
                 continue
             }
-            let usedNs = (cpu.user - prev.user) + (cpu.system - prev.system)
-            list.append((pid, Double(usedNs) / 1_000_000_000 / elapsed * 100))
+            let usedNs = Double((cpu.user - prev.user) + (cpu.system - prev.system)) * self.nsPerTick
+            // one decimal, the same precision as ps (the popup shows the raw value)
+            list.append((pid, (usedNs / 1_000_000_000 / elapsed * 100).rounded(toPlaces: 1), nil))
         }
         
         self.previous = current
@@ -299,12 +349,15 @@ public class ProcessReader: Reader<[TopProcess]> {
         
         guard elapsed > 0 else { return nil }
         
+        for process in self.privilegedProcesses(inaccessible) {
+            list.append((Int32(process.pid), process.usage, process.name))
+        }
         list.sort { $0.usage > $1.usage }
         
         var processes: [TopProcess] = []
         processes.reserveCapacity(min(self.numberOfProcesses, list.count))
         for item in list.prefix(self.numberOfProcesses) {
-            processes.append(TopProcess(pid: Int(item.pid), name: self.processName(item.pid), usage: item.usage))
+            processes.append(TopProcess(pid: Int(item.pid), name: item.name ?? self.processName(item.pid), usage: item.usage))
         }
         return processes
     }
@@ -319,7 +372,7 @@ public class ProcessReader: Reader<[TopProcess]> {
         if let cached = self.nameCache[pid], now - cached.ts < 30 {
             command = cached.command
         } else {
-            command = processPath(pid) ?? processShortName(pid) ?? "\(pid)"
+            command = processDisplayName(pid) ?? "\(pid)"
             self.nameCache[pid] = (now, command)
             if self.nameCache.count > 2048 {
                 self.nameCache = [:]
@@ -735,42 +788,16 @@ public class AverageLoadReader: Reader<CPU_AverageLoad> {
     }
     
     public override func read() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/uptime")
-        
-        let outputPipe = Pipe()
-        defer {
-            outputPipe.fileHandleForReading.closeFile()
-        }
-        task.standardOutput = outputPipe
-        
-        do {
-            try task.run()
-        } catch let err {
-            error("error read uptime: \(err.localizedDescription)", log: self.log)
+        // same values as uptime(1), read in-process instead of spawning it
+        var list: [Double] = [0, 0, 0]
+        guard getloadavg(&list, 3) == 3 else {
+            error("getloadavg() failed", log: self.log)
             return
         }
         
-        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        guard let raw = String(data: outputData, encoding: .utf8), let line = raw.split(separator: "\n").first else {
-            return
-        }
-        
-        let str = line.trimmingCharacters(in: .whitespaces)
-        let strFind = str.findAndCrop(pattern: "(\\d+(.|,)\\d+ *){3}$")
-        let strArr = strFind.cropped.split(separator: " ")
-        guard strArr.count == 3 else { return }
-        
-        var list: [Double] = []
-        strArr.forEach { (n: Substring) in
-            let value = Double(n.replacingOccurrences(of: ",", with: ".")) ?? 0
-            list.append(value)
-        }
-        guard list.count == 3 else { return }
-        
-        self.load.load1 = list[0]
-        self.load.load5 = list[1]
-        self.load.load15 = list[2]
+        self.load.load1 = list[0].rounded(toPlaces: 2)
+        self.load.load5 = list[1].rounded(toPlaces: 2)
+        self.load.load15 = list[2].rounded(toPlaces: 2)
         
         self.callback(self.load)
     }

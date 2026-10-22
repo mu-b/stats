@@ -19,6 +19,7 @@ internal class Settings: NSStackView, Settings_v {
     private var updateIntervalValue: Int = 1
     private var updateTopIntervalValue: Int = 1
     private var numberOfProcesses: Int = 8
+    private var processesLegacyReaderState: Bool = false
     private var clustersGroupState: Bool = false
     
     private let title: String
@@ -42,6 +43,7 @@ internal class Settings: NSStackView, Settings_v {
         self.updateIntervalValue = Store.shared.int(key: "\(self.title)_updateInterval", defaultValue: self.updateIntervalValue)
         self.updateTopIntervalValue = Store.shared.int(key: "\(self.title)_updateTopInterval", defaultValue: self.updateTopIntervalValue)
         self.numberOfProcesses = Store.shared.int(key: "\(self.title)_processes", defaultValue: self.numberOfProcesses)
+        self.processesLegacyReaderState = Store.shared.bool(key: "\(self.title)_processesLegacyReader", defaultValue: self.processesLegacyReaderState)
         if !self.usagePerCoreState {
             self.hyperthreadState = false
         }
@@ -81,6 +83,10 @@ internal class Settings: NSStackView, Settings_v {
                 action: #selector(self.changeNumberOfProcesses),
                 items: NumbersOfProcesses.map{ KeyValue_t(key: "\($0)", value: "\($0)") },
                 selected: "\(self.numberOfProcesses)"
+            )),
+            PreferencesRow(localizedString("Use ps/top for top processes"), component: switchView(
+                action: #selector(self.toggleProcessesLegacyReader),
+                state: self.processesLegacyReaderState
             ))
         ]))
         
@@ -147,6 +153,11 @@ internal class Settings: NSStackView, Settings_v {
             Store.shared.set(key: "\(self.title)_processes", value: value)
             self.callbackWhenUpdateNumberOfProcesses()
         }
+    }
+    
+    @objc private func toggleProcessesLegacyReader(_ sender: NSControl) {
+        self.processesLegacyReaderState = controlState(sender)
+        Store.shared.set(key: "\(self.title)_processesLegacyReader", value: self.processesLegacyReaderState)
     }
     
     @objc func toggleUsagePerCore(_ sender: NSControl) {

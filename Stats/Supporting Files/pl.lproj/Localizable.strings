@@ -266,6 +266,7 @@
 "Scale value" = "Wartość skali";
 "Text widget value" = "Wartość widżetu tekstowego";
 "Combined processes" = "Zgrupowane procesy";
+"Use ps/top for top processes" = "Użyj ps/top dla najaktywniejszych procesów";
 
 // CPU
 "CPU usage" = "Obciążenie procesora";

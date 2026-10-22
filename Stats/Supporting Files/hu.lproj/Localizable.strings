@@ -266,6 +266,7 @@
 "Scale value" = "Skála értéke"; // gemma4:31b
 "Text widget value" = "Szövegwidzset értéke"; // gemma4:31b
 "Combined processes" = "Csoportosított folyamatok"; // gemma4:31b
+"Use ps/top for top processes" = "ps/top használata a top folyamatokhoz";
 
 // CPU
 "CPU usage" = "CPU használat";

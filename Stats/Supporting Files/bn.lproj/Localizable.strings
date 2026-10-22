@@ -266,6 +266,7 @@
 "Scale value" = "স্কেল মান";
 "Text widget value" = "টেক্সট উইজেটের মান";
 "Combined processes" = "সম্মিলিত প্রসেস";
+"Use ps/top for top processes" = "শীর্ষ প্রসেসের জন্য ps/top ব্যবহার করুন";
 
 // CPU
 "CPU usage" = "CPU ব্যবহার";

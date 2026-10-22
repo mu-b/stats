@@ -60,6 +60,7 @@ internal class InfoReader: Reader<GPUs> {
         if let list = SystemKit.shared.device.info.gpu {
             self.displays = list
         }
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(self.resetAccelerators), name: NSWorkspace.didWakeNotification, object: nil)
         
         guard let PCIdevices = fetchIOService("IOPCIDevice") else {
             return
@@ -106,39 +107,91 @@ internal class InfoReader: Reader<GPUs> {
         let agcInfo: [String: Int]?
     }
     
-    /// Fetches only the registry keys the reader needs from every IOAccelerator, instead of
-    /// copying each accelerator's entire property dictionary on every read.
-    private func fetchAccelerators() -> [acceleratorInfo]? {
+    private struct acceleratorService {
+        let entry: io_registry_entry_t
+        let ioClass: String
+        let pciMatch: String
+    }
+    
+    // retained IOAccelerator services with their static properties, so the registry matching
+    // does not run on every read. re-discovered periodically, on wake and when a cached
+    // service stops serving stats (e.g. eGPU unplugged)
+    private var services: [acceleratorService] = []
+    private var servicesDiscoveredAt: TimeInterval? = nil
+    private let servicesRefreshInterval: TimeInterval = 60
+    private let servicesLock = NSLock()
+    
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        self.releaseAccelerators()
+    }
+    
+    @objc private func resetAccelerators() {
+        self.servicesLock.lock()
+        defer { self.servicesLock.unlock() }
+        self.servicesDiscoveredAt = nil
+    }
+    
+    private func releaseAccelerators() {
+        self.services.forEach { IOObjectRelease($0.entry) }
+        self.services.removeAll()
+    }
+    
+    private func discoverAccelerators() {
+        self.releaseAccelerators()
+        self.servicesDiscoveredAt = ProcessInfo.processInfo.systemUptime
+        
         var iterator = io_iterator_t()
         guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(kIOAcceleratorClassName), &iterator) == kIOReturnSuccess else {
-            return nil
+            return
         }
         defer { IOObjectRelease(iterator) }
         
-        var accelerators: [acceleratorInfo] = []
         var obj = IOIteratorNext(iterator)
         while obj != 0 {
-            defer {
-                IOObjectRelease(obj)
-                obj = IOIteratorNext(iterator)
-            }
+            let entry = obj
+            obj = IOIteratorNext(iterator)
             
-            guard let ioClass = getIOProperty(obj, "IOClass") as? String else {
+            guard let ioClass = getIOProperty(entry, "IOClass") as? String else {
                 error("IOClass not found", log: self.log)
-                continue
-            }
-            guard let stats = getIOProperty(obj, "PerformanceStatistics") as? [String: Any] else {
-                error("PerformanceStatistics not found", log: self.log)
+                IOObjectRelease(entry)
                 continue
             }
             
-            let pciMatch = ((getIOProperty(obj, "IOPCIMatch") as? String) ?? (getIOProperty(obj, "IOPCIPrimaryMatch") as? String) ?? "").lowercased()
+            let pciMatch = ((getIOProperty(entry, "IOPCIMatch") as? String) ?? (getIOProperty(entry, "IOPCIPrimaryMatch") as? String) ?? "").lowercased()
+            // ownership of the retained entry moves into the cache
+            self.services.append(acceleratorService(entry: entry, ioClass: ioClass, pciMatch: pciMatch))
+        }
+    }
+    
+    /// Fetches only the registry keys the reader needs from every IOAccelerator, instead of
+    /// copying each accelerator's entire property dictionary on every read.
+    private func fetchAccelerators() -> [acceleratorInfo]? {
+        self.servicesLock.lock()
+        defer { self.servicesLock.unlock() }
+        
+        if self.services.isEmpty || self.servicesDiscoveredAt.map({ ProcessInfo.processInfo.systemUptime - $0 >= self.servicesRefreshInterval }) ?? true {
+            self.discoverAccelerators()
+        }
+        
+        var accelerators: [acceleratorInfo] = []
+        var stale = false
+        for service in self.services {
+            guard let stats = getIOProperty(service.entry, "PerformanceStatistics") as? [String: Any] else {
+                error("PerformanceStatistics not found", log: self.log)
+                stale = true
+                continue
+            }
+            
             accelerators.append(acceleratorInfo(
-                ioClass: ioClass,
+                ioClass: service.ioClass,
                 stats: stats,
-                pciMatch: pciMatch,
-                agcInfo: getIOProperty(obj, "AGCInfo") as? [String: Int]
+                pciMatch: service.pciMatch,
+                agcInfo: getIOProperty(service.entry, "AGCInfo") as? [String: Int]
             ))
+        }
+        if stale {
+            self.servicesDiscoveredAt = nil
         }
         
         return accelerators.isEmpty ? nil : accelerators
@@ -356,7 +409,16 @@ internal class InfoReader: Reader<GPUs> {
         
         let size = CFDictionaryGetCount(channel)
         guard let mutable = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, size, channel),
-              let dict = mutable as? [String: Any], dict["IOReportChannels"] != nil else { return }
+              let list = (mutable as NSDictionary)["IOReportChannels"] as? [CFDictionary] else { return }
+        
+        // subscribe only to the ANE channels: the group has hundreds of channels (331 on M-series)
+        // and every one of them would be sampled and bridged on each read otherwise
+        let ane = list.filter { item in
+            (IOReportChannelGetChannelName(item)?.takeUnretainedValue() as String?)?.starts(with: "ANE") ?? false
+        }
+        if !ane.isEmpty {
+            (mutable as NSMutableDictionary)["IOReportChannels"] = ane as NSArray
+        }
         
         self.aneChannels = mutable
         var sub: Unmanaged<CFMutableDictionary>?
